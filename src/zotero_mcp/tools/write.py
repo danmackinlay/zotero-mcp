@@ -39,6 +39,42 @@ def _extract_attachment_key(attach_result) -> str | None:
     return None
 
 
+def _resolve_collections_arg(
+    read_zot,
+    collections,
+    ctx,
+    *,
+    create_missing: bool = False,
+    write_zot=None,
+) -> list[str]:
+    """Normalize the caller's ``collections`` argument and resolve every spec
+    (key, name, or '/'-path) to a live collection key.
+
+    Raises ValueError with a user-facing message on unknown or ambiguous
+    specs — callers should fail the add *before* creating an item, so a typo
+    can't produce an unfiled or invisibly-filed item.
+    """
+    specs = _helpers._normalize_str_list_input(collections, "collections")
+    if not specs:
+        return []
+    return _helpers.resolve_collection_specs(
+        read_zot, specs,
+        create_missing=create_missing, write_zot=write_zot, ctx=ctx,
+    )
+
+
+def _collections_status(coll_keys: list[str], missing: list[str]) -> str:
+    """Render the post-create collection-membership state for tool output."""
+    if not coll_keys:
+        return "My Library (no collection)"
+    if missing:
+        return (
+            f"Filed in {sorted(set(coll_keys) - set(missing))}; "
+            f"FAILED to file in {missing}"
+        )
+    return f"Filed in {coll_keys}"
+
+
 @mcp.tool(
     name="zotero_batch_update_tags",
     description=(
@@ -432,7 +468,9 @@ def search_collections(
     description=(
         "Add or remove one or more items from collections. "
         "item_keys must be an ARRAY of item keys, e.g. [\"KEY1\", \"KEY2\"] — not a single string. "
-        "add_to and remove_from also accept arrays of collection keys. "
+        "add_to and remove_from accept arrays of collection keys, names, or "
+        "'/'-separated paths (resolved and validated automatically; unknown, "
+        "trashed, or ambiguous specs fail before anything is changed). "
         "Use zotero_search_items to find item keys and zotero_search_collections to find collection keys."
     )
 )
@@ -451,37 +489,28 @@ def manage_collections(
 
     try:
         keys = _helpers._normalize_str_list_input(item_keys, "item_keys")
-        add_colls = _helpers._normalize_str_list_input(add_to, "add_to")
-        remove_colls = _helpers._normalize_str_list_input(remove_from, "remove_from")
+        add_specs = _helpers._normalize_str_list_input(add_to, "add_to")
+        remove_specs = _helpers._normalize_str_list_input(remove_from, "remove_from")
 
         if not keys:
             return "Error: No item keys provided."
-        if not add_colls and not remove_colls:
+        if not add_specs and not remove_specs:
             return "Error: Must specify add_to and/or remove_from."
 
-        # Validate collection keys before doing any work — Zotero will happily
-        # accept add/remove against a trashed collection, leaving items
-        # parented under an invisible bucket so the caller sees "success" but
-        # nothing renders in the desktop client (#233).
-        validation_errors: list[str] = []
-        for coll_key in list(add_colls) + list(remove_colls):
-            trashed = _helpers.is_collection_trashed(write_zot, coll_key)
-            if trashed is None:
-                validation_errors.append(
-                    f"Collection '{coll_key}' was not found in the active "
-                    f"library. Use zotero_search_collections (with "
-                    f"include_trashed=True if needed) to find a valid key."
-                )
-            elif trashed:
-                validation_errors.append(
-                    f"Collection '{coll_key}' is in the Trash. Restore it "
-                    f"in Zotero (or create a new collection) before adding "
-                    f"or removing items — the underlying API will accept "
-                    f"the call but the change won't be visible in the "
-                    f"normal collection tree."
-                )
-        if validation_errors:
-            return "Error:\n" + "\n".join(validation_errors)
+        # Resolve specs (keys, names, or '/'-paths) to live collection keys
+        # before doing any work. Resolution also validates existence — Zotero
+        # will happily accept add/remove against a trashed collection, leaving
+        # items parented under an invisible bucket so the caller sees
+        # "success" but nothing renders in the desktop client (#233).
+        try:
+            add_colls = _helpers.resolve_collection_specs(
+                read_zot, add_specs, ctx=ctx
+            )
+            remove_colls = _helpers.resolve_collection_specs(
+                read_zot, remove_specs, ctx=ctx
+            )
+        except ValueError as e:
+            return f"Error: {e}"
 
         results = []
 
@@ -534,9 +563,11 @@ def manage_collections(
         "zotero_add_from_file. "
         "doi: the DOI string (with or without the '10.' prefix, with or "
         "without a leading 'https://doi.org/'). "
-        "collections: optional list of 8-character collection keys (or "
-        "collection names — resolved automatically) to file the item "
-        "under. "
+        "collections: optional list of collection keys, names, or "
+        "'/'-separated paths (e.g. '_project/topic') — resolved and "
+        "validated before the item is created; unknown or ambiguous "
+        "specs fail the call with suggestions instead of producing an "
+        "unfiled item. "
         "tags: optional list of tag strings to attach. "
         "attach_mode: 'auto' (default) downloads a PDF if CrossRef links "
         "one and storage is available; 'none' skips PDF download; "
@@ -568,6 +599,13 @@ def add_by_doi(
         normalized = _helpers._normalize_doi(doi)
         if not normalized:
             return f"Error: '{doi}' does not appear to be a valid DOI."
+
+        # Resolve collection specs (keys/names/paths) BEFORE any network or
+        # write work — a bad spec must not produce an unfiled item.
+        try:
+            coll_keys = _resolve_collections_arg(read_zot, collections, ctx)
+        except ValueError as e:
+            return f"Error: {e}"
 
         ctx.info(f"Fetching metadata for DOI: {normalized}")
 
@@ -669,8 +707,7 @@ def add_by_doi(
         if tag_list:
             item_data["tags"] = [{"tag": t} for t in tag_list]
 
-        # Collections
-        coll_keys = _helpers._normalize_str_list_input(collections, "collections")
+        # Collections (resolved to live keys above, before the CrossRef fetch)
         if coll_keys:
             item_data["collections"] = coll_keys
 
@@ -687,15 +724,7 @@ def add_by_doi(
             missing = _helpers.ensure_collection_membership(
                 write_zot, item_key, coll_keys, ctx=ctx
             )
-            if coll_keys and missing:
-                collections_status = (
-                    f"Filed in {sorted(set(coll_keys) - set(missing))}; "
-                    f"FAILED to file in {missing}"
-                )
-            elif coll_keys:
-                collections_status = f"Filed in {coll_keys}"
-            else:
-                collections_status = "My Library (no collection)"
+            collections_status = _collections_status(coll_keys, missing)
 
             # Attempt open-access PDF attachment (pass CrossRef metadata for arXiv fallback)
             pdf_status = _helpers._try_attach_oa_pdf(write_zot, item_key, normalized, ctx,
@@ -734,8 +763,9 @@ def add_by_doi(
         "the routing and is more robust. For a local file use "
         "zotero_add_from_file. "
         "url: the URL to import. "
-        "collections: optional list of 8-character collection keys (or "
-        "names) to file the item under. "
+        "collections: optional list of collection keys, names, or "
+        "'/'-separated paths — resolved and validated before the item is "
+        "created; unknown or ambiguous specs fail the call. "
         "tags: optional list of tag strings to attach. "
         "attach_mode: 'auto' (default) attaches a PDF if one is "
         "available; 'none' skips; 'required' fails if no PDF can be "
@@ -780,9 +810,14 @@ def add_by_url(
         arxiv_id = _helpers._normalize_arxiv_id(url)
         if arxiv_id:
             return _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx,
-                                 attach_mode=attach_mode)
+                                 attach_mode=attach_mode, read_zot=read_zot)
 
         # Generic webpage
+        try:
+            coll_keys = _resolve_collections_arg(read_zot, collections, ctx)
+        except ValueError as e:
+            return f"Error: {e}"
+
         ctx.info(f"Creating webpage item for: {url}")
         template = write_zot.item_template("webpage")
         template["url"] = url
@@ -792,15 +827,18 @@ def add_by_url(
         tag_list = _helpers._normalize_str_list_input(tags, "tags")
         if tag_list:
             template["tags"] = [{"tag": t} for t in tag_list]
-        coll_keys = _helpers._normalize_str_list_input(collections, "collections")
         if coll_keys:
             template["collections"] = coll_keys
 
         result = write_zot.create_items([template])
         if isinstance(result, dict) and result.get("success"):
             item_key = next(iter(result["success"].values()))
+            missing = _helpers.ensure_collection_membership(
+                write_zot, item_key, coll_keys, ctx=ctx
+            )
             return (
-                f"Created webpage item for: {url}\n\nItem key: `{item_key}`\n\n"
+                f"Created webpage item for: {url}\n\nItem key: `{item_key}`\n"
+                f"Collections: {_collections_status(coll_keys, missing)}\n\n"
                 "_Note: To include this item in semantic search, run "
                 "zotero_update_search_database._"
             )
@@ -812,8 +850,14 @@ def add_by_url(
 
 
 @with_zotero_api_lock
-def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto"):
+def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto",
+                  read_zot=None):
     """Add an arXiv paper by ID. Internal helper for add_by_url."""
+    try:
+        coll_keys = _resolve_collections_arg(read_zot or write_zot, collections, ctx)
+    except ValueError as e:
+        return f"Error: {e}"
+
     ctx.info(f"Fetching arXiv metadata for: {arxiv_id}")
 
     resp = None
@@ -883,13 +927,15 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
     tag_list = _helpers._normalize_str_list_input(tags, "tags")
     if tag_list:
         template["tags"] = [{"tag": t} for t in tag_list]
-    coll_keys = _helpers._normalize_str_list_input(collections, "collections")
     if coll_keys:
         template["collections"] = coll_keys
 
     result = write_zot.create_items([template])
     if isinstance(result, dict) and result.get("success"):
         item_key = next(iter(result["success"].values()))
+        missing = _helpers.ensure_collection_membership(
+            write_zot, item_key, coll_keys, ctx=ctx
+        )
 
         # arXiv always has a free PDF — try to attach it
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
@@ -928,6 +974,7 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
             f"Successfully added arXiv paper: **{title}**\n\n"
             f"Item key: `{item_key}`\n"
             f"arXiv ID: {arxiv_id}\n"
+            f"Collections: {_collections_status(coll_keys, missing)}\n"
             f"PDF: {pdf_status}\n\n"
             "_Note: To include this item in semantic search, run "
             "zotero_update_search_database._"
@@ -1092,6 +1139,11 @@ def add_by_isbn(
                 "(checksum failed or wrong length)."
             )
 
+        try:
+            coll_keys = _resolve_collections_arg(read_zot, collections, ctx)
+        except ValueError as e:
+            return f"Error: {e}"
+
         ctx.info(f"Resolving ISBN {normalized} via Open Library...")
         meta = _lookup_isbn_openlibrary(normalized, ctx)
         if not meta:
@@ -1125,18 +1177,21 @@ def add_by_isbn(
         tag_list = _helpers._normalize_str_list_input(tags, "tags")
         if tag_list:
             item_data["tags"] = [{"tag": t} for t in tag_list]
-        coll_keys = _helpers._normalize_str_list_input(collections, "collections")
         if coll_keys:
             item_data["collections"] = coll_keys
 
         result = write_zot.create_items([item_data])
         if isinstance(result, dict) and result.get("success"):
             item_key = next(iter(result["success"].values()))
+            missing = _helpers.ensure_collection_membership(
+                write_zot, item_key, coll_keys, ctx=ctx
+            )
             return (
                 f"Successfully added: **{item_data.get('title', normalized)}**\n\n"
                 f"Item key: `{item_key}`\n"
                 f"Type: book\n"
                 f"ISBN: {normalized}\n"
+                f"Collections: {_collections_status(coll_keys, missing)}\n"
                 f"Source: {meta['source']}\n\n"
                 "_Note: Open Library and Google Books metadata can be noisy "
                 "(publisher-as-author, concatenated places, off-by-one dates). "
@@ -1971,7 +2026,9 @@ def get_pdf_outline(
         "file_path: ABSOLUTE path to a .pdf or .epub file (relative "
         "paths fail). Other extensions are rejected. "
         "title: optional override if metadata extraction misses. "
-        "collections: optional list of 8-char keys/names to file under. "
+        "collections: optional list of collection keys, names, or "
+        "'/'-separated paths to file under — resolved and validated "
+        "before the item is created. "
         "tags: optional list of tag strings. "
         "Requires a writable library (fails in local-only mode). PDF "
         "uploads may hit the 300MB Zotero cloud free-tier quota — "
@@ -2006,6 +2063,11 @@ def add_from_file(
         file_path = os.path.realpath(file_path)
         if not os.path.isfile(file_path):
             return f"Error: File not found: {file_path}"
+
+        try:
+            coll_keys = _resolve_collections_arg(read_zot, collections, ctx)
+        except ValueError as e:
+            return f"Error: {e}"
 
         ext = os.path.splitext(file_path)[1].lower()
         allowed_exts = {".pdf", ".epub", ".djvu", ".doc", ".docx", ".odt", ".rtf"}
@@ -2047,7 +2109,7 @@ def add_from_file(
         # Create the metadata item
         if extracted_doi:
             ctx.info(f"Found DOI: {extracted_doi}")
-            result_msg = add_by_doi(doi=extracted_doi, collections=collections, tags=tags, ctx=ctx)
+            result_msg = add_by_doi(doi=extracted_doi, collections=coll_keys, tags=tags, ctx=ctx)
             # Extract item key from result
             key_match = re.search(r'Item key: `([^`]+)`', result_msg)
             if key_match:
@@ -2062,13 +2124,17 @@ def add_from_file(
             tag_list = _helpers._normalize_str_list_input(tags, "tags")
             if tag_list:
                 template["tags"] = [{"tag": t} for t in tag_list]
-            coll_keys = _helpers._normalize_str_list_input(collections, "collections")
             if coll_keys:
                 template["collections"] = coll_keys
 
             result = write_zot.create_items([template])
             if isinstance(result, dict) and result.get("success"):
                 parent_key = next(iter(result["success"].values()))
+                missing = _helpers.ensure_collection_membership(
+                    write_zot, parent_key, coll_keys, ctx=ctx
+                )
+                if missing:
+                    ctx.warning(f"Failed to file {parent_key} in {missing}")
             else:
                 return f"Failed to create item: {result}"
 
@@ -2457,20 +2523,28 @@ def _create_and_attach(
     """Create one Zotero item and, if it has a DOI, try to attach an OA PDF.
 
     Returns a dict ``{"ok": bool, "key": str|None, "doi": str|None,
-    "pdf_status": str|None, "error": str|None, "title": str}``.
+    "pdf_status": str|None, "error": str|None, "title": str,
+    "collections_failed": list[str]}``.
     """
     title = item_data.get("title") or "(untitled)"
     try:
         result = write_zot.create_items([item_data])
     except Exception as e:
         return {"ok": False, "key": None, "doi": None, "pdf_status": None,
-                "error": str(e), "title": title}
+                "error": str(e), "title": title, "collections_failed": []}
 
     if not (isinstance(result, dict) and result.get("success")):
         return {"ok": False, "key": None, "doi": None, "pdf_status": None,
-                "error": f"create_items failed: {result}", "title": title}
+                "error": f"create_items failed: {result}", "title": title,
+                "collections_failed": []}
 
     item_key = next(iter(result["success"].values()))
+
+    # #235 backstop: atomic filing via item["collections"] is intermittent.
+    collections_failed = _helpers.ensure_collection_membership(
+        write_zot, item_key, item_data.get("collections") or [], ctx=ctx
+    )
+
     doi_raw = item_data.get("DOI") or ""
     doi = _helpers._normalize_doi(doi_raw) if doi_raw else None
 
@@ -2484,7 +2558,8 @@ def _create_and_attach(
             pdf_status = f"OA PDF attach failed: {e}"
 
     return {"ok": True, "key": item_key, "doi": doi, "pdf_status": pdf_status,
-            "error": None, "title": title}
+            "error": None, "title": title,
+            "collections_failed": collections_failed}
 
 
 def _format_batch_result(header: str, results: list[dict]) -> str:
@@ -2501,6 +2576,10 @@ def _format_batch_result(header: str, results: list[dict]) -> str:
                 lines.append(f"DOI: {r['doi']}")
             if r["pdf_status"]:
                 lines.append(f"PDF: {r['pdf_status']}")
+            if r.get("collections_failed"):
+                lines.append(
+                    f"WARNING: failed to file in {r['collections_failed']}"
+                )
         else:
             lines.append(f"Failed to add **{r['title']}**: {r['error']}")
     else:
@@ -2513,6 +2592,8 @@ def _format_batch_result(header: str, results: list[dict]) -> str:
                     line += f" (DOI: {r['doi']})"
                 if r["pdf_status"]:
                     line += f" [{r['pdf_status']}]"
+                if r.get("collections_failed"):
+                    line += f" [failed to file in {r['collections_failed']}]"
                 lines.append(line)
             else:
                 lines.append(f"{i}. ❌ {r['title']}: {r['error']}")
@@ -2573,6 +2654,11 @@ def add_by_bibtex(
         if not entries:
             return "Error: No valid @entries found in the BibTeX input."
 
+        try:
+            coll_keys = _resolve_collections_arg(_read_zot, collections, ctx)
+        except ValueError as e:
+            return f"Error: {e}"
+
         ctx.info(f"Parsed {len(entries)} BibTeX entries")
 
         results = []
@@ -2589,7 +2675,7 @@ def add_by_bibtex(
                 })
                 continue
 
-            _apply_caller_tags_and_collections(item_data, tags, collections)
+            _apply_caller_tags_and_collections(item_data, tags, coll_keys)
             results.append(_create_and_attach(write_zot, item_data, attach_mode, ctx))
 
         return _format_batch_result("# zotero_add_by_bibtex", results)
@@ -2647,6 +2733,11 @@ def add_by_csl_json(
         if not entries:
             return "Error: No valid CSL JSON objects provided."
 
+        try:
+            coll_keys = _resolve_collections_arg(_read_zot, collections, ctx)
+        except ValueError as e:
+            return f"Error: {e}"
+
         ctx.info(f"Processing {len(entries)} CSL JSON entries")
 
         results = []
@@ -2663,7 +2754,7 @@ def add_by_csl_json(
                 })
                 continue
 
-            _apply_caller_tags_and_collections(item_data, tags, collections)
+            _apply_caller_tags_and_collections(item_data, tags, coll_keys)
             results.append(_create_and_attach(write_zot, item_data, attach_mode, ctx))
 
         return _format_batch_result("# zotero_add_by_csl_json", results)
