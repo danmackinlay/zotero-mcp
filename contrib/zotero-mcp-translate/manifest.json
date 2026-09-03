@@ -7,9 +7,8 @@
   "applications": {
     "zotero": {
       "id": "zotero-mcp-translate@danmackinlay.name",
-      "update_url": "https://example.invalid/no-updates.json",
       "strict_min_version": "7.0",
-      "strict_max_version": "9.*"
+      "strict_max_version": "10.*"
     }
   }
 }
