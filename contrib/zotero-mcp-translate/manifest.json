@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "name": "zotero-mcp translate endpoint",
+  "version": "0.1.0",
+  "description": "Exposes Zotero's own web translators over the connector HTTP server, so a CLI can get connector-quality metadata without a browser or a Node translation-server.",
+  "homepage_url": "https://github.com/54yyyu/zotero-mcp/issues/229",
+  "applications": {
+    "zotero": {
+      "id": "zotero-mcp-translate@danmackinlay.name",
+      "update_url": "https://example.invalid/no-updates.json",
+      "strict_min_version": "7.0",
+      "strict_max_version": "9.*"
+    }
+  }
+}
