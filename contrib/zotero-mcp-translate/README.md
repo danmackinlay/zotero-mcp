@@ -70,6 +70,11 @@ absolute path to this directory.
 cd contrib/zotero-mcp-translate && zip -r ../zotero-mcp-translate.xpi manifest.json bootstrap.js README.md
 ```
 
+Zotero refuses a plugin whose manifest has no `applications.zotero.update_url`
+("update_url not provided" in the Browser Console). It points at
+`updates.json` here, which lists no updates, so update checks find nothing
+rather than a 404.
+
 ## Security note
 
 The endpoint is not `permitBookmarklet`, deliberately. It fetches an arbitrary
