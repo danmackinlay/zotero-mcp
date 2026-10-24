@@ -121,16 +121,23 @@ publisher, 2026-10-24:
 | SpringerLink | OK | full record + PDF | full record + PDF, ~2 s |
 | PLOS ONE | OK | full record + PDF | full record + PDF, ~1 s |
 | IEEE Xplore | blocked | null document, worked 1 run in 3 | full record + PDF, 2–8 s, every run |
-| Wiley | blocked | 403 | full record + PDF; ~65 s on first contact, then ~2 s |
+| Wiley | blocked | 403 | full record + PDF once a challenge clears (see below), then ~2 s |
 | ScienceDirect | blocked | 403 | Cloudflare challenge, never cleared |
 | Oxford (OUP) | blocked | 403 | Cloudflare challenge, never cleared |
+| Cambridge Core (book) | | book record with ISBN and publisher | the same, ~33 s |
+| UNC Press (book) | blocked | Embedded Metadata: a `blogPost`, no authors | the same |
+| Oxford Academic (book) | | 403 | Cloudflare challenge, never cleared |
 
 "Full record" means every author, with accents intact, plus the abstract.
+The three book sites are the ones in this issue's original report. Zotero
+has no UNC Press translator, so the connector would fall back to Embedded
+Metadata there too: that record is the page's own metadata.
 
-Wiley sits behind a Cloudflare challenge that clears after about a minute.
-The challenge page never moves on to the article by itself in a hidden
-browser; only a later load gets through, which is why a blocked page is
-reloaded every 15 s. Once cleared, later loads of other Wiley articles
+Wiley sits behind a Cloudflare challenge that clears after some time on
+it: about a minute in one run, more than 90 s (the default `settleMs`) in
+another, after which the next try passed in 18 s. The challenge page never
+moves on to the article by itself in a hidden browser; only a later load
+gets through, which is why a blocked page is reloaded every 15 s. Once cleared, later loads of other Wiley articles
 pass in about 2 s for a while. Even the `"xhr"` fetch then gets the article
 page, though Wiley still refuses its follow-up citation request. The
 clearance did not survive a Zotero restart. Zotero's windowless frame
