@@ -174,14 +174,25 @@ async function translateWithBrowser(url, { save, collection, settleMs, browserOp
   let translate = null;
   let page = {};
   try {
+    // load() gives up after 5 s with no navigation event and returns false,
+    // but the load carries on (Cambridge Core takes longer than that to
+    // start), so a false here is not a failure: the loop below waits for
+    // whatever document arrives, until the deadline.
     if (!(await browser.load(url))) {
-      throw new Error("hidden browser failed to load " + url);
+      log(`no navigation within 5 s for ${url}; waiting for it`);
     }
     let loadedAt = Date.now();
     let loads = 1;
 
-    for (;;) {
-      await browser.waitForDocument({ allowInteractiveAfter: 5000 });
+    // One look at the page: its status and title, then detect and translate
+    // if it is not blocked. Returns a result, or null to look again.
+    const attempt = async () => {
+      // waitForDocument has no timeout of its own; getPageData below does,
+      // so a page that never gets ready fails there instead of hanging.
+      await Promise.race([
+        browser.waitForDocument({ allowInteractiveAfter: 5000 }),
+        Zotero.Promise.delay(Math.max(0, Math.min(30000, deadline - Date.now()))),
+      ]);
       const data = await browser.getPageData(["title", "channelInfo"]);
       page = {
         finalUrl: browser.currentURI.spec,
@@ -191,35 +202,40 @@ async function translateWithBrowser(url, { save, collection, settleMs, browserOp
         browser: mainWindow ? "main-window" : "hidden-frame",
         loads,
       };
+      if (isBlocked(page)) return null;
 
-      if (!isBlocked(page)) {
-        // A navigation replaces the window global the Translation actor
-        // lives on, so each attempt needs a RemoteTranslate bound to it.
-        if (translate) translate.dispose();
-        translate = new RemoteTranslate({ disableErrorReporting: true });
-        await translate.setBrowser(browser);
-        const translators = await translate.detect();
-        if (translators && translators.length) {
-          try {
-            // detect() leaves the whole priority-ordered list selected,
-            // and translate() runs its head, as the connector does.
-            const label = translators[0].label;
-            if (!save) {
-              const items = await translate.translate({ libraryID: false });
-              return { translator: label, items: items || [], page };
-            }
-            const saved = await translate.translate(saveTarget(collection));
-            return { translator: label, items: (saved || []).map(savedSummary), page };
-          }
-          catch (e) {
-            // The page navigated under the translator (IEEE does this), so
-            // its actor went with it: look again at wherever it went.
-            if (!/destroyed before query/.test(String(e && e.message)) || Date.now() > deadline) {
-              throw e;
-            }
-            log(`page navigated during translation of ${url}; retrying`);
-          }
+      // A navigation replaces the window global the Translation actor lives
+      // on, so each attempt needs a RemoteTranslate bound to it.
+      if (translate) translate.dispose();
+      translate = new RemoteTranslate({ disableErrorReporting: true });
+      await translate.setBrowser(browser);
+      const translators = await translate.detect();
+      if (!translators || !translators.length) return null;
+
+      // detect() leaves the whole priority-ordered list selected, and
+      // translate() runs its head, as the connector does.
+      const label = translators[0].label;
+      if (!save) {
+        const items = await translate.translate({ libraryID: false });
+        return { translator: label, items: items || [], page };
+      }
+      const saved = await translate.translate(saveTarget(collection));
+      return { translator: label, items: (saved || []).map(savedSummary), page };
+    };
+
+    for (;;) {
+      try {
+        const result = await attempt();
+        if (result) return result;
+      }
+      catch (e) {
+        // The page navigated mid-attempt (IEEE during translation, UNC Press
+        // while the document loads), and the actor being queried went with
+        // it: look again at wherever it went.
+        if (!/destroyed before query/.test(String(e && e.message)) || Date.now() > deadline) {
+          throw e;
         }
+        log(`page navigated during an attempt on ${url}; retrying`);
       }
 
       if (Date.now() > deadline) {
@@ -239,6 +255,25 @@ async function translateWithBrowser(url, { save, collection, settleMs, browserOp
     if (translate) translate.dispose();
     browser.destroy();
   }
+}
+
+// Items from an in-process translation can carry live objects: a snapshot
+// attachment holds the page's `document`, whose DOM refers back to itself,
+// so JSON.stringify throws "cyclic object value" (Cambridge Core and UNC
+// Press both do this). Keep the document's URL, which is what a caller can
+// use, and drop any other repeated reference.
+function jsonSafe(items) {
+  const seen = new WeakSet();
+  return JSON.parse(JSON.stringify(items, function (key, value) {
+    if (key === "document" && value && typeof value === "object") {
+      try { return String(value.location.href); } catch (e) { return undefined; }
+    }
+    if (value && typeof value === "object") {
+      if (seen.has(value)) return undefined;
+      seen.add(value);
+    }
+    return value;
+  }));
 }
 
 async function translateUrl(url, options) {
@@ -316,7 +351,7 @@ TranslateEndpoint.prototype = {
         translator: result.translator,
         saved: data.save === true,
         page: result.page,
-        items: result.items,
+        items: jsonSafe(result.items),
       })];
     } catch (e) {
       Zotero.logError(e);
