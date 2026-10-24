@@ -1,7 +1,9 @@
 # zotero-mcp translate endpoint (prototype)
 
-**Status: unproven prototype. Not wired into `zotero-mcp`, not proposed upstream.**
-It exists to answer one question, stated at the bottom of this file.
+**Status: prototype. Not wired into `zotero-mcp`, not proposed upstream.**
+It existed to answer one question, whether Zotero's own fetch gets past the
+publisher firewalls. The answer, measured, is at the bottom of this file: it
+does for four of the six publishers tried, and two still block it.
 
 ## Why
 
@@ -58,6 +60,30 @@ including their `attachments` array — the thing translation-server drops:
 Optional `"collection": "C12"` (a `treeViewID`) overrides the collection
 selected in the Zotero UI, which is otherwise where a connector save lands.
 
+### How the page is fetched
+
+`"fetch"` picks how the page is fetched before the translator runs on it:
+
+- `"browser"` (the default) loads it in Zotero's `HiddenBrowser`, which
+  renders it with JavaScript, and runs the translator inside the rendered
+  page through `RemoteTranslate`. This is how Zotero translates a feed item
+  from its web page. The browser is attached to Zotero's main window, which
+  is what got past Wiley's check (see below). If the main window is closed
+  it falls back to Zotero's windowless frame, and `page.browser` in the
+  response says which was used. `"browserOptions": {"useHiddenFrame": true}`
+  forces the frame.
+- `"xhr"` uses `Zotero.HTTP.processDocuments`, a plain request with no
+  JavaScript, which is what the first version did.
+
+A browser fetch keeps looking for up to `"settleMs"` (default 90000, at
+most 180000) while the page is an HTTP error or a Cloudflare "Just a
+moment..." page, reloading it every 15 s, since a challenge can clear in
+the background without the page itself moving on. It never translates one: translators match on the URL alone, so
+they would otherwise turn the challenge page into an item titled "Just a
+moment...". A page still blocked at the deadline comes back as
+`502 {"error": "BLOCKED", "page": {...}}`, with the HTTP status and title
+of where it ended up.
+
 ## Installing
 
 Zip the three files (not the directory containing them) into
@@ -83,32 +109,42 @@ is for a local process the user started — not for any web page that can reach
 127.0.0.1. Anything listening on loopback is reachable by every page in the
 user's browser, so this is the difference between a tool and a vulnerability.
 
-## The open question
+## The open question, answered
 
-**Does Zotero's own fetch get past the publisher WAFs that block plain HTTP
-clients?** This has not been tested and is the thing that decides whether the
-plugin is worth finishing.
+**Does Zotero's own fetch get past the publisher firewalls that block plain
+HTTP clients?** For four of the six publishers tried, yes. Measured on
+Zotero 10.0.6 with `contrib/test-plugin.sh` and new articles from each
+publisher, 2026-10-24:
 
-Measured against `link.springer.com` on 2026-09-03, a `Mozilla/`-prefixed
-User-Agent got a ~3 KB challenge page while an honest `zotero-mcp/1.0` UA got
-the full article. Chrome gets through everywhere. Where a plain Python client
-lands is publisher-specific — of twelve publishers tested, four served their
-`citation_*` tags to a plain HTTP client and eight did not.
+| Publisher | Plain HTTP client | `"xhr"` | `"browser"` (main window) |
+|---|---|---|---|
+| SpringerLink | OK | full record + PDF | full record + PDF, ~2 s |
+| PLOS ONE | OK | full record + PDF | full record + PDF, ~1 s |
+| IEEE Xplore | blocked | null document, worked 1 run in 3 | full record + PDF, 2–8 s, every run |
+| Wiley | blocked | 403 | full record + PDF; ~65 s on first contact, then ~2 s |
+| ScienceDirect | blocked | 403 | Cloudflare challenge, never cleared |
+| Oxford (OUP) | blocked | 403 | Cloudflare challenge, never cleared |
 
-`Zotero.HTTP.processDocuments` uses Gecko's network stack, which is a real
-browser's, so it may well do better than `requests`. If it does, this plugin
-gives connector-quality metadata *and* the PDF with no Node and no browser. If
-it doesn't, it only helps on publishers that were never the problem, and the
-honest answer is to script a real browser instead.
+"Full record" means every author, with accents intact, plus the abstract.
 
-To find out, install it and try a blocked publisher:
+Wiley sits behind a Cloudflare challenge that clears after about a minute.
+The challenge page never moves on to the article by itself in a hidden
+browser; only a later load gets through, which is why a blocked page is
+reloaded every 15 s. Once cleared, later loads of other Wiley articles
+pass in about 2 s for a while. Even the `"xhr"` fetch then gets the article
+page, though Wiley still refuses its follow-up citation request. The
+clearance did not survive a Zotero restart. Zotero's windowless frame
+(`"useHiddenFrame": true`) never cleared it: two new articles stayed
+blocked through 150 s and 10 reloads each, which is why the main window is
+the default.
 
-```bash
-curl -s -X POST http://127.0.0.1:23119/zotero-mcp/translate \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://onlinelibrary.wiley.com/doi/abs/10.1111/j.1461-0248.2005.00792.x"}'
-```
+ScienceDirect and OUP stayed on the challenge through 145 s of reloads in
+the main window. They need a real browser.
 
-Wiley served 0 citation meta tags to curl and 29 to Chrome, so it is a clean
-discriminator. A `NO_TRANSLATOR` response, or a record thinner than the browser
-produces, means Gecko was challenged too.
+So the plugin gets connector-quality metadata and a PDF link from four of
+the six, with no Node and no visible browser, two more than a DOI lookup or
+a plain HTTP client. The cost is latency: a request to a publisher that
+stays blocked takes the full `settleMs` (90 s by default) to fail.
+
+The `"xhr"` column first measured the same way on 2026-10-03 (Zotero
+10.0.5), apart from the IEEE run that worked.
