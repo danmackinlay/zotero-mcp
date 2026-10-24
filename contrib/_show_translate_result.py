@@ -17,6 +17,16 @@ def main() -> None:
         print(f"    NOT JSON: {raw[:200]}")
         return
 
+    page = data.get("page")
+    if page:
+        print(
+            f"    page       : HTTP {page.get('status')} in {page.get('elapsedMs')} ms"
+            f" ({page.get('browser')}),"
+            f" title {str(page.get('title'))[:50]!r}"
+        )
+        if page.get("finalUrl") and page["finalUrl"] != data.get("url"):
+            print(f"    landed on  : {page['finalUrl'][:80]}")
+
     if "error" in data:
         print(f"    {data['error']}: {str(data.get('message', ''))[:120]}")
         return

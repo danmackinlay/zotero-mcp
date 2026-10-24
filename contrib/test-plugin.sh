@@ -7,23 +7,37 @@
 # Python client? The BLOCKED rows below are the discriminator -- a plain
 # client gets zero citation_* tags from them, Chrome gets a full page.
 #
-#   usage: contrib/test-plugin.sh
+# Each URL is tried with every fetch mode asked for: "xhr" is the plain
+# Zotero.HTTP.processDocuments fetch, "browser" renders the page in a
+# HiddenBrowser with JavaScript.
+#
+#   usage: contrib/test-plugin.sh [xhr|browser|both]   (default: both)
+#   SETTLE_MS=60000 contrib/test-plugin.sh browser     longer challenge wait
 set -u
 
 EP=http://127.0.0.1:23119/zotero-mcp/translate
+case "${1:-both}" in
+  xhr|browser) MODES="$1" ;;
+  both) MODES="xhr browser" ;;
+  *) echo "usage: $0 [xhr|browser|both]" >&2; exit 2 ;;
+esac
 
 hit () {
   local label="$1" expectation="$2" url="$3"
   printf '\n=== %-32s (plain HTTP client: %s)\n    %s\n' "$label" "$expectation" "$url"
-  local body
-  body=$(curl -s -m 90 -X POST "$EP" \
-           -H 'Content-Type: application/json' \
-           -d "{\"url\":\"$url\"}" 2>&1)
-  if [ -z "$body" ]; then
-    echo "    NO RESPONSE -- is Zotero running and the plugin installed?"
-    return
-  fi
-  printf %s "$body" | python3 "$(dirname "$0")/_show_translate_result.py"
+  local body mode extra=""
+  [ -n "${SETTLE_MS:-}" ] && extra=",\"settleMs\":$SETTLE_MS"
+  for mode in $MODES; do
+    echo "  -- fetch=$mode"
+    body=$(curl -s -m 200 -X POST "$EP" \
+             -H 'Content-Type: application/json' \
+             -d "{\"url\":\"$url\",\"fetch\":\"$mode\"$extra}" 2>&1)
+    if [ -z "$body" ]; then
+      echo "    NO RESPONSE -- is Zotero running and the plugin installed?"
+      continue
+    fi
+    printf %s "$body" | python3 "$(dirname "$0")/_show_translate_result.py"
+  done
 }
 
 echo "Zotero connector server:"
