@@ -259,6 +259,7 @@ PDFs are parsed with [pdf-inspector](https://github.com/firecrawl/pdf-inspector)
 | `pdf_max_pages` | `50` | Pages extracted per PDF when indexing. Raising it does not widen what search sees on its own — that is bounded by the embedding model's token limit or `chunking.max_chunks_per_item`. |
 | `fulltext_display_max_pages` | `10` | Pages returned by `zotero_get_item_fulltext`. Separate from the above because reading a paper is bounded by your assistant's context, not by recall. |
 | `attachment_priority` | `["pdf", "html", "other"]` | Order in which attachment kinds are tried when an item has several readable files. |
+| `converted_pages_dir` | none | Folder of page text converted outside zotero-mcp, laid out as `<dir>/<ATTACHMENT_KEY>/pages/<n>.md` (`n` is the page of the PDF, from 1). `zotero_read_pdf_pages` returns a page's file from there instead of the text layer, which loses math and has nothing for a scan. `ZOTERO_CONVERTED_PAGES_DIR` overrides it. |
 
 **`attachment_priority`** exists for the case where you have converted a paper to clean Markdown yourself and attached it next to the original PDF. By default the PDF still wins; listing `"markdown"` first makes your converted copy the one that gets read and indexed. Valid entries are `pdf`, `html`, `markdown`, `text` and `other`. `other` is a catch-all matching every kind not named elsewhere in the list, so the default sweeps Markdown and plain text into one bucket where the larger file wins. Omitting `other` means anything unlisted is never chosen.
 

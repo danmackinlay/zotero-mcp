@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 class ExtractionConfig:
     pdf_max_pages: int | None = None
     fulltext_display_max_pages: int | None = None
+    # Folder of page text converted outside zotero-mcp (e.g. by an OCR or
+    # LaTeX-recovering converter): <dir>/<ATTACHMENT_KEY>/pages/<n>.md. When a
+    # page has a file there, zotero_read_pdf_pages returns it instead of the
+    # text layer. None means no such folder.
+    converted_pages_dir: str | None = None
     # Order in which attachment kinds are considered when an item has more
     # than one readable file. None means the default (PDF > HTML > rest);
     # see zotero_mcp.extract.normalize_attachment_priority (#378).
