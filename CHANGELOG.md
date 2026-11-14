@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`zotero_read_pdf_pages` and `zotero-cli read` can return page text converted outside zotero-mcp.** Text extraction loses math and has nothing for a scan, and the converters that do better are too slow and too large to run inside a read. Set `semantic_search.extraction.converted_pages_dir` (or `ZOTERO_CONVERTED_PAGES_DIR`) to a folder laid out as `<ATTACHMENT_KEY>/pages/<n>.md`, and a page with a file there is returned from it, without the garbled-text flag. Pages without one read from the text layer as before.
+
 ## [0.17.1] - 2026-11-12
 
 ### Added

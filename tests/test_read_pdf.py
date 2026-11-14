@@ -358,3 +358,86 @@ class TestCleanupPathSafety:
         server.read_pdf_pages(item_key="ITEM01", start_page=1, ctx=dummy_ctx)
 
         assert removed == []
+
+
+class TestConvertedPages:
+    """Page text converted elsewhere replaces the text layer where it exists."""
+
+    def _library(self, tmp_path, monkeypatch, pages):
+        """A converted-pages folder and a PDF path inside a storage folder."""
+        root = tmp_path / "converted"
+        folder = root / "ATTACH01" / "pages"
+        folder.mkdir(parents=True)
+        for number, text in pages.items():
+            (folder / f"{number}.md").write_text(text, encoding="utf-8")
+        monkeypatch.setenv("ZOTERO_CONVERTED_PAGES_DIR", str(root))
+        storage = tmp_path / "storage" / "ATTACH01"
+        storage.mkdir(parents=True)
+        return str(storage / "paper.pdf")
+
+    def test_converted_page_replaces_text_layer(self, monkeypatch, dummy_ctx, fake_zot, tmp_path):
+        _patch_extract(monkeypatch, ["Garbled p1.", "Garbled p2.", "Garbled p3."])
+        pdf = self._library(tmp_path, monkeypatch, {2: "For any $\\delta > 0$ we have\n"})
+        monkeypatch.setattr(
+            "zotero_mcp.tools.read_pdf._get_pdf_path", lambda _k, _c: (pdf, "Paper", False),
+        )
+        monkeypatch.setattr(
+            "zotero_mcp.tools.read_pdf._garbled_content_flags",
+            lambda _p, _d: {1: "> **Garbled in this text:** inline math"},
+        )
+
+        result = server.read_pdf_pages(item_key="PARENT01", start_page=1, end_page=3, ctx=dummy_ctx)
+
+        assert "Garbled p1." in result and "Garbled p3." in result
+        assert "Garbled p2." not in result
+        assert "For any $\\delta > 0$ we have" in result
+        # The converted page is not flagged, and with no flag left there is no image hint.
+        assert "Garbled in this text" not in result
+        assert "format='image'" not in result
+        assert "Converted text, not the PDF's text layer, on page 2" in result
+
+    def test_attachment_key_given_directly(self, monkeypatch, dummy_ctx, fake_zot, tmp_path):
+        """A downloaded PDF has no storage folder; the key the caller passed still finds its pages."""
+        _patch_extract(monkeypatch, ["Garbled p1."])
+        self._library(tmp_path, monkeypatch, {1: "Converted p1."})
+        monkeypatch.setattr(
+            "zotero_mcp.tools.read_pdf._get_pdf_path",
+            lambda _k, _c: ("/tmp/zotero_pdf_x/paper.pdf", "Paper", True),
+        )
+
+        result = server.read_pdf_pages(item_key="ATTACH01", start_page=1, ctx=dummy_ctx)
+
+        assert "Converted p1." in result and "Garbled p1." not in result
+
+    def test_no_folder_configured_changes_nothing(self, monkeypatch, dummy_ctx, fake_zot, tmp_path):
+        _patch_extract(monkeypatch, ["Text layer p1."])
+        pdf = self._library(tmp_path, monkeypatch, {1: "Converted p1."})
+        monkeypatch.delenv("ZOTERO_CONVERTED_PAGES_DIR")
+        monkeypatch.setattr(
+            "zotero_mcp.tools.read_pdf._converted_pages_dir", lambda: None,
+        )
+        monkeypatch.setattr(
+            "zotero_mcp.tools.read_pdf._get_pdf_path", lambda _k, _c: (pdf, "Paper", False),
+        )
+
+        result = server.read_pdf_pages(item_key="PARENT01", start_page=1, ctx=dummy_ctx)
+
+        assert "Text layer p1." in result
+        assert "Converted" not in result
+
+    def test_key_is_never_used_as_a_path(self, monkeypatch, dummy_ctx, fake_zot, tmp_path):
+        """An item key that is not a Zotero key cannot walk out of the folder."""
+        _patch_extract(monkeypatch, ["Text layer p1."])
+        self._library(tmp_path, monkeypatch, {1: "Converted p1."})
+        outside = tmp_path / "pages"
+        outside.mkdir()
+        (outside / "1.md").write_text("Outside the folder.", encoding="utf-8")
+        monkeypatch.setattr(
+            "zotero_mcp.tools.read_pdf._get_pdf_path",
+            lambda _k, _c: ("/tmp/zotero_pdf_x/paper.pdf", "Paper", True),
+        )
+
+        result = server.read_pdf_pages(item_key="..", start_page=1, ctx=dummy_ctx)
+
+        assert "Text layer p1." in result
+        assert "Outside the folder." not in result

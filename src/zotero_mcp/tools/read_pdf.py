@@ -5,6 +5,7 @@ import re
 import tempfile
 import unicodedata
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Literal
 
 from zotero_mcp import client as _client
@@ -309,6 +310,64 @@ def _page_range(
             _cleanup_path(pdf_path)
 
 
+#: A Zotero item key. Checked before a key is used as a folder name.
+_ITEM_KEY = re.compile(r"^[A-Z0-9]{8}$")
+
+
+def _converted_pages_dir() -> Path | None:
+    """The folder of externally converted page text, if one is configured.
+
+    ``ZOTERO_CONVERTED_PAGES_DIR`` wins over the config file's
+    ``semantic_search.extraction.converted_pages_dir``.
+    """
+    configured = os.getenv("ZOTERO_CONVERTED_PAGES_DIR")
+    if not configured:
+        try:
+            configured = load_config().semantic_search.extraction.converted_pages_dir
+        except Exception:
+            configured = None
+    if not configured:
+        return None
+    path = Path(configured).expanduser()
+    return path if path.is_dir() else None
+
+
+def _converted_pages(item_key: str, pdf_path: str, page_indices) -> dict[int, str]:
+    """Converted Markdown for the pages (0-indexed) that have some.
+
+    Text extraction loses math, and a scan may have no text layer at all. A
+    converter that reads the page image (MinerU, marker, a vision model) can
+    do better, but is too slow and too large to run inside a read. So the
+    converting happens elsewhere, and its output is picked up here from
+    ``<dir>/<ATTACHMENT_KEY>/pages/<n>.md``, ``n`` being the 1-indexed page of
+    the PDF. A page without a file reads from the text layer as before.
+
+    The attachment key is the name of the PDF's folder in Zotero storage, or
+    ``item_key`` when the caller named the attachment itself. A PDF fetched
+    into a temporary folder through its parent item has neither, and gets no
+    converted pages.
+    """
+    root = _converted_pages_dir()
+    if root is None:
+        return {}
+    for key in dict.fromkeys((Path(pdf_path).parent.name, item_key.strip())):
+        if not _ITEM_KEY.match(key):
+            continue
+        folder = root / key / "pages"
+        if not folder.is_dir():
+            continue
+        found: dict[int, str] = {}
+        for page_index in page_indices:
+            try:
+                text = (folder / f"{page_index + 1}.md").read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if text:
+                found[page_index] = text
+        return found
+    return {}
+
+
 def read_pdf_text(
     item_key: str,
     start_page: int,
@@ -336,7 +395,12 @@ def read_pdf_text(
                     f"Could not read PDF for item {item_key}: {exc}",
                     code="pdf_unreadable",
                 ) from exc
-            flags = _garbled_content_flags(pdf_path, doc)
+            converted = _converted_pages(item_key, pdf_path, doc.page_numbers)
+            flags = {
+                page_index: note
+                for page_index, note in _garbled_content_flags(pdf_path, doc).items()
+                if page_index not in converted
+            }
 
         output = [
             f"# PDF Pages {start_page}-{actual_end} of {title}",
@@ -350,7 +414,9 @@ def read_pdf_text(
         for page_index, markdown in zip(doc.page_numbers, doc.pages):
             output.append(f"## Page {page_index + 1}")
             output.append("")
-            if markdown.strip():
+            if page_index in converted:
+                output.append(converted[page_index])
+            elif markdown.strip():
                 output.append(markdown.strip())
             elif page_index in doc.needs_ocr:
                 output.append("*[No text layer on this page — it is a scanned image]*")
@@ -359,6 +425,13 @@ def read_pdf_text(
             output.append("")
             if page_index in flags:
                 output.extend([flags[page_index], ""])
+        if converted:
+            listed = ", ".join(str(page_index + 1) for page_index in sorted(converted))
+            output.extend([
+                f"*Converted text, not the PDF's text layer, on page{'s' if len(converted) > 1 else ''} "
+                f"{listed}: math there is LaTeX.*",
+                "",
+            ])
         if flags:
             output.append(_IMAGE_HINTS[surface].format(item_key=item_key))
         return _helpers._prepend_size_warning(
