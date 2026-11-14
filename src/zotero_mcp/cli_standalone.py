@@ -26,10 +26,13 @@ from zotero_mcp import cli_json as _cli_json
 # Reuse environment setup from the original CLI module
 from zotero_mcp.cli import (
     _format_chunking_status,
-    _print_batch_import,
-    _print_batch_status,
-    _print_update_stats,
+    add_batch_import_arguments,
+    add_batch_status_arguments,
+    add_update_db_arguments,
     obfuscate_config_for_display,
+    run_batch_import,
+    run_batch_status,
+    run_update_db,
     setup_zotero_environment,
     tolerate_console_encoding,
 )
@@ -39,10 +42,18 @@ from zotero_mcp.cli import (
 # ---------------------------------------------------------------------------
 
 class CLIContext:
-    """Drop-in replacement for fastmcp.Context that writes to stderr."""
+    """Drop-in replacement for fastmcp.Context that writes to stderr.
+
+    Errors are held until the command's result is printed (see
+    :func:`_flush_errors`): a tool that fails typically logs the raw exception
+    and then returns the same failure, explained, and printing both showed
+    every failure twice, the unhelpful version first (#744). With --verbose
+    they print as they happen.
+    """
 
     def __init__(self, verbose: bool = False):
         self._verbose = verbose
+        self._held_errors: list[str] = []
 
     def info(self, message: str) -> None:
         if self._verbose:
@@ -52,7 +63,32 @@ class CLIContext:
         print(f"[WARN] {message}", file=sys.stderr)
 
     def error(self, message: str) -> None:
-        print(f"[ERROR] {message}", file=sys.stderr)
+        if self._verbose:
+            print(f"[ERROR] {message}", file=sys.stderr)
+        else:
+            self._held_errors.append(str(message))
+
+    def flush_errors(self, failure: str | None = None, shown: str | None = None) -> None:
+        """Print held errors, leaving out those the output already reports.
+
+        An error is left out when it opens with the same words, up to the
+        first colon, as the first line of *failure* ("Error adding by
+        BibTeX: [Errno 61] ..." against "Error adding by BibTeX: Zotero is
+        not running ..."), or when the result *shown* contains it verbatim.
+        """
+        held, self._held_errors = self._held_errors, []
+        reported = _error_head(failure) if failure else None
+        for message in held:
+            if reported is not None and _error_head(message) == reported:
+                continue
+            if shown and message in shown:
+                continue
+            print(f"[ERROR] {message}", file=sys.stderr)
+
+
+def _error_head(text: str) -> str:
+    first = text.strip().splitlines()[0] if text.strip() else ""
+    return first.split(":", 1)[0].strip(" #*>").lower()
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +103,22 @@ def _import_tools():
 
 
 def _ctx(args) -> CLIContext:
-    return CLIContext(verbose=getattr(args, "verbose", False))
+    """The command's context: one per command, so its held errors are
+    printed once, by :func:`_flush_errors`."""
+    ctx = getattr(args, "_cli_ctx", None)
+    if not isinstance(ctx, CLIContext):
+        ctx = CLIContext(verbose=getattr(args, "verbose", False))
+        try:
+            args._cli_ctx = ctx
+        except Exception:
+            pass
+    return ctx
+
+
+def _flush_errors(args, failure: str | None = None, shown: str | None = None) -> None:
+    ctx = getattr(args, "_cli_ctx", None)
+    if isinstance(ctx, CLIContext):
+        ctx.flush_errors(failure, shown)
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +142,9 @@ def _out(args, command: str, *, data=None, text: str | None = None) -> None:
     """
     if text is not None:
         text = _cli_vocabulary(text)
-    if data is None and text is not None and _reports_failure(text):
+    failed = data is None and text is not None and _reports_failure(text)
+    _flush_errors(args, text if failed else None, text)
+    if failed:
         # Most tools return their failures as prose rather than raising. Left
         # alone, that prose became an `ok: true` envelope with exit code 0, so
         # a caller that checked `ok` believed a failed write had worked.
@@ -249,7 +302,7 @@ def cmd_search(args):
 
     if args.mode == "tag":
         result = search_mod.search_by_tag(
-            tag=args.query.split(","), limit=args.limit,
+            tag=_split_tags(args.query), limit=args.limit,
             collection_key=getattr(args, "collection", None), ctx=ctx,
         )
     elif args.mode == "citekey":
@@ -276,7 +329,8 @@ def cmd_search(args):
                 sys.exit(1)
         result = search_mod.semantic_search(
             query=args.query, limit=args.limit, filters=filters,
-            search_all_libraries=getattr(args, "all_libraries", False), ctx=ctx,
+            search_all_libraries=getattr(args, "all_libraries", False),
+            level=getattr(args, "level", None), ctx=ctx,
         )
     elif args.mode == "notes":
         result = annotations.search_notes(query=args.query, limit=args.limit, ctx=ctx)
@@ -355,7 +409,7 @@ def cmd_get(args):
                 "collections": [_cli_json.project_collection(c) for c in cols],
             })
             return
-        print(retrieval.get_collections(limit=args.limit, ctx=ctx))
+        _out(args, "get collections", text=retrieval.get_collections(limit=args.limit, ctx=ctx))
     elif sub == "collection-items":
         result = retrieval.get_collection_items(
             collection_key=args.collection_key, detail=args.detail, limit=args.limit,
@@ -403,7 +457,7 @@ def cmd_get(args):
                 "tags": [_cli_json.project_tag(t) for t in tags],
             })
             return
-        print(retrieval.get_tags(limit=args.limit, ctx=ctx))
+        _out(args, "get tags", text=retrieval.get_tags(limit=args.limit, ctx=ctx))
     elif sub == "recent":
         result = retrieval.get_recent(
             limit=args.limit, collection_key=getattr(args, "collection", None), ctx=ctx,
@@ -462,9 +516,10 @@ def cmd_annotations(args):
             text=getattr(args, "text", None),
             rect=_parse_rect(getattr(args, "rect", None)),
             note=_parse_rect(getattr(args, "note", None), size=2, flag="--note"),
+            underline=getattr(args, "underline", False),
             comment=getattr(args, "comment", None),
             color=_resolve_color(args.color),
-            tags=_split_csv(getattr(args, "tags", None)), ctx=ctx,
+            tags=_split_tags(getattr(args, "tags", None)), ctx=ctx,
         )
         if getattr(args, "open", False) and not _reports_failure(text):
             import re
@@ -478,8 +533,8 @@ def cmd_annotations(args):
         _out(args, "annotations update", text=annotations.update_annotation(
             annotation_key=args.annotation_key, text=getattr(args, "text", None),
             comment=getattr(args, "comment", None), color=getattr(args, "color", None),
-            add_tags=_split_csv(getattr(args, "add_tags", None)),
-            remove_tags=_split_csv(getattr(args, "remove_tags", None)), ctx=ctx,
+            add_tags=_split_tags(getattr(args, "add_tags", None)),
+            remove_tags=_split_tags(getattr(args, "remove_tags", None)), ctx=ctx,
         ))
     elif args.subcommand == "delete":
         _out(args, "annotations delete", text=annotations.delete_annotation(
@@ -583,7 +638,7 @@ def _annotations_batch(args, annotations, ctx) -> None:
             where = f"#{r['index']} p{r['page']}"
             if not r["ok"]:
                 print(f"FAIL  {where}: {r['error']}")
-            elif args.dry_run and r["type"] == "highlight":
+            elif args.dry_run and r["type"] in ("highlight", "underline"):
                 found = r.get("page_found") or r.get("chapter_found")
                 moved = f" (found on p{found})" if found not in (None, r["page"]) else ""
                 print(f"ok    {where}{moved}: {r.get('matched_text', '')[:120]}")
@@ -677,7 +732,7 @@ def cmd_notes(args):
             print("Error: provide note text via --text TEXT or --text - (reads stdin)",
                   file=sys.stderr)
             sys.exit(1)
-        tags = args.tags.split(",") if args.tags else []
+        tags = _split_tags(args.tags) or []
         _out(args, "notes create", text=annotations.create_note(
             item_key=args.item_key, note_title=args.title or "CLI Note",
             note_text=note_text, tags=tags, ctx=ctx,
@@ -712,7 +767,7 @@ def cmd_add(args):
     setup_zotero_environment()
     search_mod, retrieval, annotations, write_mod, _client = _import_tools()
     ctx = _ctx(args)
-    tags = args.tags.split(",") if args.tags else None
+    tags = _split_tags(args.tags)
     collections = _collect_collection_specs(args)
     if_exists = getattr(args, "if_exists", "file")
     create_missing = getattr(args, "create_collections", False)
@@ -798,17 +853,29 @@ def cmd_collections(args):
 
 
 def cmd_tags(args):
+    # Deprecated in 0.15.2, removal in 0.17: `batch` does the same with --add-tags/--remove-tags.
+    print("zotero-cli tags is deprecated and will be removed in 0.17; use: "
+          "zotero-cli batch --add-tags ... --remove-tags ...", file=sys.stderr)
     setup_zotero_environment()
     search_mod, retrieval, annotations, write_mod, _client = _import_tools()
     ctx = _ctx(args)
     _out(args, "tags", text=write_mod.batch_update_tags(
         query=args.query or "",
-        add_tags=args.add.split(",") if args.add else None,
-        remove_tags=args.remove.split(",") if args.remove else None,
-        tag=args.tag.split(",") if args.tag else None,
+        add_tags=_split_tags(args.add),
+        remove_tags=_split_tags(args.remove),
+        tag=_split_tags(args.tag),
         limit=args.limit,
+        item_keys=_split_csv(args.item_keys),
         ctx=ctx,
     ))
+
+
+def _field_assignment(value: str) -> tuple[str, str]:
+    """Parse one metadata assignment, preserving empty values and '=' in text."""
+    name, separator, text = value.partition("=")
+    if not separator or not name.strip():
+        raise argparse.ArgumentTypeError("expected NAME=VALUE with a nonempty field name")
+    return name.strip(), text
 
 
 def cmd_edit(args):
@@ -847,14 +914,17 @@ def cmd_edit(args):
         "book_title": args.book_title,
     }
     fields = {k: v for k, v in flat_fields.items() if v is not None}
+    # Keep the writer's schema validation and base-field resolution in one
+    # place. Explicit generic assignments take precedence over named flags.
+    fields.update(getattr(args, "field", None) or [])
 
     _out(args, "edit", text=write_mod.update_item(
         item_key=args.item_key,
         fields=fields or None,
         creators=creators,
-        tags=args.tags.split(",") if args.tags else None,
-        add_tags=args.add_tags.split(",") if args.add_tags else None,
-        remove_tags=args.remove_tags.split(",") if args.remove_tags else None,
+        tags=_split_tags(args.tags),
+        add_tags=_split_tags(args.add_tags),
+        remove_tags=_split_tags(args.remove_tags),
         collections=args.collections.split(",") if args.collections else None,
         collection_names=args.collection_names.split(",") if args.collection_names else None,
         ctx=ctx,
@@ -884,9 +954,19 @@ def cmd_duplicates(args):
 
 def cmd_db(args):
     """Manage the semantic search database."""
+    # Shared with `zotero-mcp update-db` / `batch-status` / `batch-import`,
+    # so the batch provider and every update flag behave the same here.
+    runner = {
+        "update": run_update_db,
+        "batch-status": run_batch_status,
+        "batch-import": run_batch_import,
+    }.get(args.subcommand)
+    if runner is not None:
+        runner(args)
+        return
+
     from pathlib import Path
     setup_zotero_environment()
-    from zotero_mcp.cli import _save_zotero_db_path_to_config
     from zotero_mcp.semantic_search import create_semantic_search
 
     config_path_arg = getattr(args, "config_path", None)
@@ -895,43 +975,7 @@ def cmd_db(args):
         else Path.home() / ".config" / "zotero-mcp" / "config.json"
     )
 
-    if args.subcommand == "update":
-        db_path = getattr(args, "db_path", None)
-        if db_path:
-            _save_zotero_db_path_to_config(config_path, db_path)
-        search = create_semantic_search(str(config_path), db_path=db_path)
-        if getattr(args, "openai_batch", None) is True and search.chroma_client.embedding_model != "openai":
-            print("Error: --openai-batch requires ZOTERO_EMBEDDING_MODEL=openai", file=sys.stderr)
-            sys.exit(1)
-        fulltext = getattr(args, "fulltext", False)
-        if fulltext:
-            from zotero_mcp.utils import is_local_mode
-            if not is_local_mode():
-                print("Error: --fulltext requires local mode (ZOTERO_LOCAL=true).", file=sys.stderr)
-                sys.exit(1)
-        stats = search.update_database(
-            force_full_rebuild=args.force_rebuild,
-            limit=args.limit,
-            extract_fulltext=fulltext,
-            use_openai_batch=getattr(args, "openai_batch", None),
-            allow_mass_deletion=getattr(args, "allow_mass_deletion", False),
-        )
-        _print_update_stats(stats)
-        if stats.get("error"):
-            print(f"Error: {stats['error']}", file=sys.stderr)
-            sys.exit(1)
-
-    elif args.subcommand == "batch-status":
-        search = create_semantic_search(str(config_path))
-        status = search.get_openai_batch_status(batch_ids=getattr(args, "batch_id", None))
-        _print_batch_status(status)
-
-    elif args.subcommand == "batch-import":
-        search = create_semantic_search(str(config_path))
-        stats = search.import_openai_batch(batch_ids=getattr(args, "batch_id", None))
-        _print_batch_import(stats)
-
-    elif args.subcommand == "status":
+    if args.subcommand == "status":
         search = create_semantic_search(str(config_path))
         status = search.get_database_status()
         ci = status.get("collection_info", {})
@@ -940,8 +984,20 @@ def cmd_db(args):
         print("=== Semantic Search Database Status ===")
         print(f"Collection: {ci.get('name', 'Unknown')}")
         print(f"Document count: {ci.get('count', 0)}")
+        print(f"  Article-level records: {ci.get('article_records', 0)}")
+        print(f"  Passage-level records: {ci.get('passage_records', 0)}")
+        for label, key in (("Items with article records", "article_items"), ("Items with passages", "passage_items")):
+            if key in ci:
+                print(f"  {label}: {'unknown' if ci[key] is None else ci[key]}")
         print(f"Embedding model: {ci.get('embedding_model', 'Unknown')}")
         print(f"Database path: {ci.get('persist_directory', 'Unknown')}")
+        if ci.get("migration"):
+            from zotero_mcp.index_migration import status_note
+            from zotero_mcp.utils import is_local_mode
+
+            print("\nIndex migration:")
+            for line in status_note(ci["migration"], "zotero-cli db update", local_mode=is_local_mode()):
+                print(f"  {line}")
         print("\nUpdate configuration:")
         print(f"- Auto update: {uc.get('auto_update', False)}")
         print(f"- Frequency: {uc.get('update_frequency', 'manual')}")
@@ -949,7 +1005,11 @@ def cmd_db(args):
         print(f"- Should update: {status.get('should_update', False)}")
         print(f"- OpenAI Batch API: {'active' if bc.get('active') else 'inactive'}")
         print(f"- Passage chunking: {_format_chunking_status(status)}")
-        if ci.get("error"):
+        if ci.get("unreadable"):
+            from zotero_mcp.chroma_client import unreadable_index_message
+
+            print(f"\nError: {unreadable_index_message(ci, uc.get('last_update'))}")
+        elif ci.get("error"):
             print(f"\nError: {ci['error']}")
 
     elif args.subcommand == "inspect":
@@ -959,8 +1019,9 @@ def cmd_db(args):
         col = client.collection
 
         if args.stats:
-            meta = col.get(include=["metadatas"])
-            metas = meta.get("metadatas", [])
+            metas = []
+            for collection in client.collections():
+                metas.extend(collection.get(include=["metadatas"]).get("metadatas", []))
             info = client.get_collection_info()
             print("=== Semantic DB Stats ===")
             print(f"Collection: {info.get('name')} @ {info.get('persist_directory')}")
@@ -1075,6 +1136,22 @@ def _split_csv(value):
     if not value:
         return None
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+#: Help suffix for every flag that takes tag names.
+TAG_LIST_HELP = "comma-separated, or a JSON array if a name has a comma"
+
+
+def _split_tags(value):
+    """Tag flag value -> list, or None when the flag was absent.
+
+    Tag names may contain commas (Library of Congress headings such as
+    "Barrel organ, Hydraulic"), which a comma split can never address. So a
+    value is read the way the MCP tools read a tag list: a JSON array (or
+    JSON string) is taken whole, anything else is comma-separated.
+    """
+    from zotero_mcp.tools._helpers import _normalize_str_list_input
+    return _normalize_str_list_input(value, "tags") or None
 
 
 #: The eight colors of Zotero's own annotation palette, by the names its
@@ -1214,7 +1291,9 @@ def cmd_attach(args):
     _s, _r, _a, write_mod, _c = _import_tools()
     _out(args, "attach", text=write_mod.attach_file(
         item_key=args.item_key, file_path=args.file, url=args.url,
-        filename=args.filename, ctx=_ctx(args),
+        filename=args.filename,
+        link_mode="linked" if getattr(args, "link", False) else "import",
+        ctx=_ctx(args),
     ))
 
 
@@ -1275,7 +1354,7 @@ def cmd_synthesize(args):
     json_mode = _json_mode(args)
     fmt = "json" if (json_mode and args.format == "markdown") else args.format
     result = synthesis_mod.synthesize_annotations(
-        collection_key=args.collection, tag=_split_csv(args.tag),
+        collection_key=args.collection, tag=_split_tags(args.tag),
         limit=args.limit, format=fmt, ctx=_ctx(args),
     )
     if json_mode:
@@ -1409,14 +1488,15 @@ def cmd_batch(args):
             _fail(args, "batch", f"invalid JSON in --set: {e}", "bad_json")
     _out(args, "batch", text=write_mod.batch_update(
         item_keys=_split_csv(args.item_keys), query=args.query or "",
-        tag=_split_csv(args.tag), add_tags=_split_csv(args.add_tags),
-        remove_tags=_split_csv(args.remove_tags), set_keys=set_keys,
+        tag=_split_tags(args.tag), add_tags=_split_tags(args.add_tags),
+        remove_tags=_split_tags(args.remove_tags), set_keys=set_keys,
         remove_keys=_split_csv(args.remove_keys), limit=args.limit, ctx=_ctx(args),
     ))
 
 
 def _fail(args, command: str, message: str, code: str = "error"):
     """Report a usage error in whichever shape the caller asked for, then exit."""
+    _flush_errors(args, f"Error: {message}")
     if _json_mode(args):
         _cli_json.emit_error(command, message, code=code)
     else:
@@ -1488,6 +1568,9 @@ def build_parser() -> argparse.ArgumentParser:
                      default="items", help="Search mode (default: items)")
     s_p.add_argument("--qmode", choices=["titleCreatorYear", "everything"],
                      default="titleCreatorYear")
+    s_p.add_argument("--level", choices=["articles", "passages"],
+                     help="With --mode semantic: search articles or passages "
+                          "(default: passages when chunking is on, articles when off)")
     s_p.add_argument("--collection", help="Scope to a collection key")
     s_p.add_argument("--limit", type=int, default=10)
     s_p.add_argument("--conditions", help='JSON conditions for advanced mode')
@@ -1552,15 +1635,17 @@ def build_parser() -> argparse.ArgumentParser:
     au.add_argument("--text")
     au.add_argument("--comment")
     au.add_argument("--color")
-    au.add_argument("--add-tags", help="Comma-separated tags to add")
-    au.add_argument("--remove-tags", help="Comma-separated tags to remove")
+    au.add_argument("--add-tags", help=f"Tags to add ({TAG_LIST_HELP})")
+    au.add_argument("--remove-tags", help=f"Tags to remove ({TAG_LIST_HELP})")
     ad = a_sub.add_parser("delete", help="Delete an annotation")
     ad.add_argument("annotation_key")
-    ac = a_sub.add_parser("create", help="Create a highlight (--text), an area box (--rect) "
-                                         "or a sticky note (--note)")
+    ac = a_sub.add_parser("create", help="Create a highlight (--text; with --underline, an "
+                                         "underline), an area box (--rect) or a sticky note (--note)")
     ac.add_argument("--attachment-key", required=True)
     ac.add_argument("--page", required=True, type=int)
     ac.add_argument("--text", help="Exact text to highlight")
+    ac.add_argument("--underline", action="store_true",
+                    help="Underline --text instead of highlighting it")
     ac.add_argument("--rect", help="Area box x,y,width,height, normalized 0-1; "
                                    "`zotero-cli layout` prints boxes for figures and tables")
     ac.add_argument("--note", help="Sticky note centered at x,y, normalized 0-1; "
@@ -1568,17 +1653,19 @@ def build_parser() -> argparse.ArgumentParser:
     ac.add_argument("--comment")
     ac.add_argument("--color", default="#ffd400",
                     help=f"Hex, or a Zotero color name: {', '.join(ZOTERO_COLORS)}")
-    ac.add_argument("--tags", help="Comma-separated tags")
+    ac.add_argument("--tags", help=f"Tags ({TAG_LIST_HELP})")
     ac.add_argument("--open", action="store_true",
                     help="Then show the new annotation in the Zotero reader")
     ab = a_sub.add_parser("batch", help="Create many annotations from JSON Lines in one run")
     ab.add_argument("--attachment-key", required=True,
                     help="Attachment for lines that do not name their own")
     ab.add_argument("--file", default="-",
-                    help="JSON Lines (or a JSON array) of {page, text|rect|note, comment, color, tags}; "
+                    help="JSON Lines (or a JSON array) of {page, text|rect|note, underline, comment, "
+                         "color, tags}; "
                          "- reads stdin")
     ab.add_argument("--dry-run", action="store_true",
-                    help="Locate every highlight and report what it would cover, without writing")
+                    help="Locate every highlight and underline and report what it would cover, "
+                         "without writing")
 
     # layout -- figure/table boxes to aim area annotations at
     ly_p = sub.add_parser("layout", help="Find figure and table boxes on PDF pages")
@@ -1600,7 +1687,7 @@ def build_parser() -> argparse.ArgumentParser:
     nc.add_argument("--item-key", required=True)
     nc.add_argument("--title")
     nc.add_argument("--text", help=_note_text_help)
-    nc.add_argument("--tags")
+    nc.add_argument("--tags", help=f"Tags ({TAG_LIST_HELP})")
     nu = n_sub.add_parser("update", help="Replace (or --append to) a note's text")
     nu.add_argument("--item-key", required=True)
     nu.add_argument("--text", help=_note_text_help)
@@ -1620,7 +1707,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Collection key, name, or parent/child path "
                             "(repeatable; not comma-split, so names with "
                             "commas work)")
-        p.add_argument("--tags", help="Comma-separated tags")
+        p.add_argument("--tags", help=f"Tags ({TAG_LIST_HELP})")
         p.add_argument("--if-exists", dest="if_exists",
                        choices=["file", "skip", "duplicate"], default="file",
                        help="When the item already exists: 'file' (default) "
@@ -1688,12 +1775,15 @@ def build_parser() -> argparse.ArgumentParser:
     cmg.add_argument("--remove-from")
 
     # tags
-    t_p = sub.add_parser("tags", help="Batch update tags on matched items")
+    t_p = sub.add_parser("tags", help="Deprecated: use batch --add-tags/--remove-tags")
+    t_p.add_argument("--item-keys",
+                     help="Comma-separated item keys to edit; --query and --tag are then ignored")
     t_p.add_argument("--query")
-    t_p.add_argument("--tag")
-    t_p.add_argument("--add")
-    t_p.add_argument("--remove")
-    t_p.add_argument("--limit", type=int, default=50)
+    t_p.add_argument("--tag", help=f"Select items by tag ({TAG_LIST_HELP}; any matches)")
+    t_p.add_argument("--add", help=f"Tags to add ({TAG_LIST_HELP})")
+    t_p.add_argument("--remove", help=f"Tags to remove ({TAG_LIST_HELP})")
+    t_p.add_argument("--limit", type=int, default=50,
+                     help="Most items to select by --query/--tag (at most 1000)")
 
     # edit (item metadata)
     e_p = sub.add_parser("edit", help="Edit metadata fields of an existing item")
@@ -1703,9 +1793,9 @@ def build_parser() -> argparse.ArgumentParser:
     e_p.add_argument("--date")
     e_p.add_argument("--publication-title")
     e_p.add_argument("--abstract")
-    e_p.add_argument("--tags", help="Replace all tags (comma-separated)")
-    e_p.add_argument("--add-tags")
-    e_p.add_argument("--remove-tags")
+    e_p.add_argument("--tags", help=f"Replace all tags ({TAG_LIST_HELP})")
+    e_p.add_argument("--add-tags", help=f"Tags to add ({TAG_LIST_HELP})")
+    e_p.add_argument("--remove-tags", help=f"Tags to remove ({TAG_LIST_HELP})")
     e_p.add_argument("--collections", help="Replace the item's collections (comma-separated keys); "
                      "use `collections manage --add-to` to add without removing")
     e_p.add_argument("--collection-names", help="Replace the item's collections (comma-separated names)")
@@ -1722,6 +1812,13 @@ def build_parser() -> argparse.ArgumentParser:
     e_p.add_argument("--edition")
     e_p.add_argument("--isbn")
     e_p.add_argument("--book-title")
+    e_p.add_argument(
+        "--field",
+        action="append",
+        type=_field_assignment,
+        metavar="NAME=VALUE",
+        help="Set a Zotero metadata field (repeatable; overrides named flags; NAME= clears a field)",
+    )
 
     # duplicates
     d_p = sub.add_parser("duplicates", help="Find or merge duplicate items")
@@ -1738,23 +1835,9 @@ def build_parser() -> argparse.ArgumentParser:
     # db
     db_p = sub.add_parser("db", help="Manage the semantic search database")
     db_sub = db_p.add_subparsers(dest="subcommand")
-    dbu = db_sub.add_parser("update")
-    dbu.add_argument("--force-rebuild", action="store_true")
-    dbu.add_argument("--limit", type=int)
-    dbu.add_argument("--fulltext", action="store_true")
-    dbu.add_argument("--allow-mass-deletion", action="store_true")
-    dbu.add_argument("--config-path")
-    dbu.add_argument("--db-path")
-    dbu_batch = dbu.add_mutually_exclusive_group()
-    dbu_batch.add_argument("--openai-batch", dest="openai_batch", action="store_true")
-    dbu_batch.add_argument("--no-openai-batch", dest="openai_batch", action="store_false")
-    dbu.set_defaults(openai_batch=None)
-    dbbs = db_sub.add_parser("batch-status")
-    dbbs.add_argument("--batch-id", action="append")
-    dbbs.add_argument("--config-path")
-    dbbi = db_sub.add_parser("batch-import")
-    dbbi.add_argument("--batch-id", action="append")
-    dbbi.add_argument("--config-path")
+    add_update_db_arguments(db_sub.add_parser("update"))
+    add_batch_status_arguments(db_sub.add_parser("batch-status"))
+    add_batch_import_arguments(db_sub.add_parser("batch-import"))
     dbs = db_sub.add_parser("status")
     dbs.add_argument("--config-path")
     dbi = db_sub.add_parser("inspect")
@@ -1797,9 +1880,12 @@ def build_parser() -> argparse.ArgumentParser:
     # attach
     at_p = sub.add_parser("attach", help="Attach a file or link a URL to an item")
     at_p.add_argument("item_key")
-    at_p.add_argument("--file", help="Path to a local file to upload")
+    at_p.add_argument("--file", help="Path to a local file to upload (or to link in place, with --link)")
     at_p.add_argument("--url", help="URL to attach as a link")
     at_p.add_argument("--filename", help="Override the stored filename")
+    at_p.add_argument("--link", action="store_true",
+                      help="With --file: link the file where it is instead of uploading a copy "
+                           "(Zotero's 'Add Link to File'; uses no cloud storage)")
 
     # delete
     del_p = sub.add_parser("delete", help="Delete an item, collection or annotation")
@@ -1836,7 +1922,7 @@ def build_parser() -> argparse.ArgumentParser:
     # synthesize
     syn_p = sub.add_parser("synthesize", help="Synthesise annotations across items")
     syn_p.add_argument("--collection")
-    syn_p.add_argument("--tag", help="Comma-separated tags to scope by")
+    syn_p.add_argument("--tag", help=f"Tags to scope by ({TAG_LIST_HELP})")
     syn_p.add_argument("--limit", type=int, default=200)
     syn_p.add_argument("--format", choices=["markdown", "json"], default="markdown")
 
@@ -1859,12 +1945,13 @@ def build_parser() -> argparse.ArgumentParser:
     b_p = sub.add_parser("batch", help="Update tags/Extra fields across many items")
     b_p.add_argument("--item-keys", help="Comma-separated item keys")
     b_p.add_argument("--query", help="Select items by search query instead")
-    b_p.add_argument("--tag", help="Comma-separated tags to select by")
-    b_p.add_argument("--add-tags", help="Comma-separated tags to add")
-    b_p.add_argument("--remove-tags", help="Comma-separated tags to remove")
+    b_p.add_argument("--tag", help=f"Tags to select by ({TAG_LIST_HELP})")
+    b_p.add_argument("--add-tags", help=f"Tags to add ({TAG_LIST_HELP})")
+    b_p.add_argument("--remove-tags", help=f"Tags to remove ({TAG_LIST_HELP})")
     b_p.add_argument("--set", help="JSON object of Extra keys to set")
     b_p.add_argument("--remove-keys", help="Comma-separated Extra keys to remove")
-    b_p.add_argument("--limit", type=int, default=50)
+    b_p.add_argument("--limit", type=int, default=50,
+                     help="Most items to select by --query/--tag (at most 1000)")
 
     return parser
 
@@ -1958,6 +2045,11 @@ fields are not removed or retyped without bumping it. Parse defensively.
 
 
 def main():
+    # Before any tool module is imported: this process never serves MCP,
+    # so the tools skip loading FastMCP (about half a second per command).
+    from zotero_mcp import _serverless
+
+    _serverless.enable()
     tolerate_console_encoding()
     parser = build_parser()
     args = parser.parse_args()
@@ -1978,12 +2070,14 @@ def main():
     try:
         handler(args)
     except KeyboardInterrupt:
+        _flush_errors(args)
         if _json_mode(args):
             _cli_json.emit_error(args.command, "Interrupted", code="interrupted")
         else:
             print("\nInterrupted.", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
+        _flush_errors(args, f"Error: {e}")
         # In JSON mode the failure has to arrive in the same shape as a
         # success, or a caller has to parse stderr to find out what happened.
         if _json_mode(args):
@@ -1998,6 +2092,9 @@ def main():
             import traceback
             traceback.print_exc()
         sys.exit(1)
+    finally:
+        # Commands that exit or return without going through _out.
+        _flush_errors(args)
 
 
 if __name__ == "__main__":

@@ -71,6 +71,12 @@ zotero-cli --json search "diffusion models" --limit 5 --detail keys_only \
 `zotero-cli db update` to build). If it is empty, fall back to `items` and
 say why rather than reporting no results.
 
+If `zotero-cli db status` shows an "Index migration" section, the index was
+built by an earlier version, with its passages in the article-level ChromaDB
+collection. Search still works; go ahead. Tell the user once, with the steps it
+lists, and that only the update in the last step embeds anything (billed with a
+paid embedding API). Ask before running any of it; never migrate on your own.
+
 Every search covers one library — the active one. When you don't know which
 library holds something, or a search comes up empty and the item might live in
 a group library, add `--all-libraries`:
@@ -168,7 +174,8 @@ To annotate, plan everything, check it, then write it in one run:
 1. `zotero-cli --json layout ATTACHMENT_KEY` lists figure, table and
    equation boxes with their captions and a paste-ready `rect_arg`.
 2. Write one JSON object per line: `{"page": 4, "text": "exact words",
-   "comment": "...", "color": "yellow"}` for a highlight, or
+   "comment": "...", "color": "yellow"}` for a highlight (add
+   `"underline": true` to underline instead), or
    `{"page": 3, "rect": "x,y,w,h", "comment": "..."}` for a box, or
    `{"page": 1, "note": "x,y", "comment": "..."}` for a sticky note
    centered on a point (its text is the comment). Copy

@@ -2,7 +2,8 @@
 // Zotero. The preview page and the Playwright scripts drive it through `host.sim`.
 import { CATALOGS, bigPiCatalog, defaultSettings } from "./fake-catalog.ts";
 import { repeatLine } from "./economy.ts";
-import { DIAGRAM_ANSWER } from "./fake-diagrams.ts";
+import { t } from "../i18n.ts";
+import { DIAGRAM_ANSWER, MERMAID_ANSWER } from "./fake-diagrams.ts";
 import { FakeSkills } from "./fake-skills.ts";
 import type {
   AgentRuntime, AgentSession, BackendId, BackendStatus, Catalog, ChatEvent, ContextChip, DoctorCheck, ItemHit, NoteRequest, PanelHost,
@@ -31,6 +32,8 @@ interface FakeOptions {
   bigPi?: boolean;
   /** Start as a first-run user: the welcome screen shows before the chat. */
   welcome?: boolean;
+  /** Zotero's UI locale ("de-DE"); the preview's `?lang=`. English by default, which the behavior tests read. */
+  locale?: string;
 }
 
 interface Sim {
@@ -258,7 +261,7 @@ class FakeSession implements AgentSession {
       }
     }
 
-    const body = long ? `${SAMPLE_ANSWER}\n\n${LONG_PARAS}` : /\b(draw|diagram)/.test(q) ? DIAGRAM_ANSWER : q.includes("math") ? "The estimator is\n\n$$\\hat{\\tau} = \\frac{1}{n}\\sum_{i=1}^{n}\\left(\\frac{T_i Y_i}{e(X_i)} - \\frac{(1-T_i)Y_i}{1-e(X_i)}\\right)$$\n\nwith propensity $e(X_i) = P(T_i = 1 \\mid X_i)$. An unclosed $$ stays text while it streams, and \\$5 is just five dollars." : SAMPLE_ANSWER;
+    const body = long ? `${SAMPLE_ANSWER}\n\n${LONG_PARAS}` : /\bmermaid\b/.test(q) ? MERMAID_ANSWER : /\b(draw|diagram)/.test(q) ? DIAGRAM_ANSWER : q.includes("math") ? "The estimator is\n\n$$\\hat{\\tau} = \\frac{1}{n}\\sum_{i=1}^{n}\\left(\\frac{T_i Y_i}{e(X_i)} - \\frac{(1-T_i)Y_i}{1-e(X_i)}\\right)$$\n\nwith propensity $e(X_i) = P(T_i = 1 \\mid X_i)$. An unclosed $$ stays text while it streams, and \\$5 is just five dollars." : SAMPLE_ANSWER;
     await this.stream(turn, "text", (this.cancelled ? "" : body));
     if (this.cancelled) return this.end(turn, "cancelled");
     this.emit({ t: "turn_end", turn, stop: "end_turn", usage: { inputTokens: 12840, outputTokens: 912, costUsd: 0.031, ...(this.sim.contextUsage ? { contextUsed: this.sim.contextUsage.used, contextSize: this.sim.contextUsage.size } : {}) } });
@@ -279,11 +282,13 @@ export class FakeHost implements PanelHost {
   private themeCbs = new Set<() => void>();
   private settingsCbs = new Set<() => void>();
   private _theme: "light" | "dark";
+  private _locale: string;
   private store = new Map<string, { meta: SavedSession; events: ChatEvent[] }>();
   private fixed = new Set<string>();
 
   constructor(o: FakeOptions = {}) {
     this._theme = o.theme ?? "light";
+    this._locale = o.locale ?? "en-US";
     this.settings.welcomed = !o.welcome;
     const sim: Sim = {
       opened: [], prompts: [], doctorMode: o.doctor ?? "ok", searchFails: false, startFails: null, catalogFails: [], pickFolder: "/Users/you/Documents/Projects/hiring-audits/paper-notes", pickImage: { name: "kyoto-evening.jpg", dataUrl: SAMPLE_IMAGE }, image: null, preparedCwd: [], catalogDelay: o.catalogDelay ?? 120, data: { cleared: 0, revealed: 0, resets: 0 }, nextAnswer: null, saved: [], saveTo: "/Users/you/Downloads", notes: [], noteFails: null, contextUsage: null, speed: o.speed ?? 18, writes: [], keys: {}, closed: 0,
@@ -292,6 +297,7 @@ export class FakeHost implements PanelHost {
         { id: "claude-code", label: "Claude Code", available: true, account: "Claude Max" },
         { id: "codex", label: "Codex", available: false, reason: "codex is not installed" },
         { id: "pi", label: "pi", available: true },
+        { id: "opencode", label: "OpenCode", available: true },
       ],
       setContext: (k) => { this.ctx = k === "none" ? [] : k === "selection" ? [ITEM_CHIP, SELECTION_CHIP] : k === "area" ? [{ ...ITEM_CHIP, id: "reader:LUND2021", label: "Lundberg 2021 - The G…", ref: { libraryID: 1, itemKey: "LUND2021" } }, AREA_CHIP] : [ITEM_CHIP]; for (const cb of [...this.ctxCbs]) cb(); },
       setTheme: (t) => { this._theme = t; for (const cb of [...this.themeCbs]) cb(); },
@@ -320,8 +326,9 @@ export class FakeHost implements PanelHost {
 
   private statuses(): BackendStatus[] {
     const m = this.sim.doctorMode;
-    return this.sim.statuses.map((s) => (s.id === "claude-code" && (m === "backend" || m === "many") && !this.fixed.has("backend")
-      ? { ...s, available: false, reason: "claude is not logged in", account: undefined } : s));
+    return [...this.sim.statuses.map((s) => (s.id === "claude-code" && (m === "backend" || m === "many") && !this.fixed.has("backend")
+      ? { ...s, available: false, reason: "claude is not logged in", account: undefined } : s)),
+      { id: "custom", label: this.settings.customAgent?.label || t("agent.custom.label"), available: !!this.settings.customAgent?.command, reason: t("agent.custom.noCommand") }];
   }
 
   // --- context
@@ -441,12 +448,14 @@ export class FakeHost implements PanelHost {
   async removeImage() { this.sim.image = null; }
   /** What each backend's own CLI takes to continue a session; the folder is quoted for the shell. */
   resumeCommand(s: SavedSession) {
-    const cmd = { "claude-code": `claude --resume ${s.agentSessionId}`, codex: `codex resume ${s.agentSessionId}`, pi: `pi --session ${s.agentSessionId}` }[s.backend];
+    if (s.backend === "custom") return null;
+    const cmd = { "claude-code": `claude --resume ${s.agentSessionId}`, codex: `codex resume ${s.agentSessionId}`, pi: `pi --session ${s.agentSessionId}`, opencode: `opencode --session ${s.agentSessionId}` }[s.backend];
     return s.agentSessionId ? `cd '${s.cwd.replace(/'/g, "'\\''")}' && ${cmd}` : null;
   }
   async prepareSession(cwd?: string) { this.sim.preparedCwd.push(cwd); return { cwd: cwd ?? this.folder(), brief: "You are in a Zotero side panel.", env: {} }; }
 
   // --- theme
+  locale() { return this._locale; }
   theme() { return this._theme; }
   onThemeChange(cb: () => void) { this.themeCbs.add(cb); return () => { this.themeCbs.delete(cb); }; }
   onSettingsChange(cb: () => void) { this.settingsCbs.add(cb); return () => { this.settingsCbs.delete(cb); }; }

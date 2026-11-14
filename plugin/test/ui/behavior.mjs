@@ -139,17 +139,37 @@ await test("pinning keeps a chip when the focus moves; dismissing hides it until
   assert.equal(await p.locator(".cchips .chip").count(), 1, "back in focus: shown again");
 });
 
-await test("selected area card: thumbnail, go to annotation, remove", async (p) => {
+await test("selected area tile: thumbnail, click goes to the annotation, × on hover removes it", async (p) => {
   await sim(p, () => window.__zmc.sim.setContext("area"));
-  assert.ok(await p.locator(".area__img").isVisible());
+  assert.ok(await p.locator(".thumb__img").isVisible());
+  const box = await p.locator(".thumb").boundingBox();
+  assert.deepEqual([box.width, box.height], [72, 72], "a small tile, not a full-width card");
+  assert.equal(await p.locator(".thumb__x").isVisible(), false, "× only on hover");
+  await p.getByRole("button", { name: /^Preview Selected Area/ }).click();
+  await p.waitForSelector(".lb .lb__img");
+  assert.ok(await p.locator(".lb__x").evaluate((b) => b === b.getRootNode().activeElement), "focus moves to Close");
+  await p.keyboard.press("Escape");
+  assert.equal(await p.locator(".lb").count(), 0, "Esc closes the preview");
+  await p.getByRole("button", { name: /^Preview Selected Area/ }).click();
+  await p.locator(".lb").click({ position: { x: 5, y: 5 } });
+  assert.equal(await p.locator(".lb").count(), 0, "a click outside the picture closes it");
+  assert.equal(await p.locator(".thumb__x").isVisible(), false, "closing with the mouse leaves no × up on the tile");
+  await p.getByRole("button", { name: /^Preview Selected Area/ }).click();
   await p.getByRole("button", { name: "Go to Annotation" }).click();
+  assert.equal(await p.locator(".lb").count(), 0);
   assert.equal((await sim(p, () => window.__zmc.sim.opened)).at(-1).annotationKey, "ANNAREA1");
   await send(p, "explain");
   await done(p);
   const images = await sim(p, () => window.__zmc.sim.prompts[0].images?.length);
   assert.equal(images, 1, "the area image goes with the question");
-  await p.getByRole("button", { name: "Remove" }).click();
-  assert.equal(await p.locator(".area").count(), 0);
+  assert.equal(await p.locator(".thumb").count(), 0, "sent, it leaves the composer while it stays selected");
+});
+
+await test("a tile's x shows on hover and removes it before sending", async (p) => {
+  await sim(p, () => window.__zmc.sim.setContext("area"));
+  await p.locator(".thumb").hover();
+  await p.locator(".thumb__x").click();
+  assert.equal(await p.locator(".thumb").count(), 0);
 });
 
 await test("an unchanged area and selection go once; later turns only name them", async (p) => {
@@ -493,6 +513,28 @@ await test("pickers: effort, model and mode act on the live session and save int
   assert.match(await p.locator(".pick--model .pick__e").innerText(), /Off/, "pi's own effort default");
 });
 
+await test("languages: Zotero in Chinese draws the panel in Chinese; the Interface language setting redraws it at once, chat and draft kept", async (p) => {
+  const english = /^[\x20-\x7e…]+$/;
+  assert.equal(await p.locator('button[aria-label="设置"]').count(), 1, "Zotero's own word for Settings");
+  assert.doesNotMatch(await p.locator(".cin").getAttribute("placeholder"), english);
+  assert.doesNotMatch(await p.locator(".empty h2").innerText(), english);
+  await send(p, "hello");
+  await done(p);
+  await p.locator(".cin").fill("a draft");
+  await p.locator('button[aria-label="设置"]').click();
+  await p.waitForSelector("#look select");
+  for (const title of await p.locator(".sec__t").allInnerTexts()) assert.doesNotMatch(title, english, `card “${title}”`);
+  assert.match(await p.locator("#look select option").first().innerText(), /简体中文/, "Automatic names Zotero's language");
+  await p.locator("#look select").selectOption("en");
+  await p.waitForSelector('button[aria-label="Settings"]');
+  assert.equal(await settings(p).then((s) => s.uiLanguage), "en");
+  assert.equal(await p.locator(".sec__t", { hasText: "Appearance" }).count(), 1, "the settings screen stays open, now in English");
+  await p.getByRole("button", { name: "Back to the chat" }).click();
+  assert.equal(await p.locator(".msg--user").count(), 1, "the chat is still there");
+  assert.equal(await p.locator(".cin").inputValue(), "a draft");
+  assert.equal(await p.locator(".cin").getAttribute("placeholder"), "Ask about your library…");
+}, { params: { lang: "zh-CN" } });
+
 await test("settings saved elsewhere (Zotero's Settings pane) apply to the open panel at once, settings screen included", async (p) => {
   await openSettings(p);
   const before = await settings(p);
@@ -511,7 +553,7 @@ await test("agent switch: an empty chat switches at once; a chat with messages a
   await p.locator(".pick--model").click();
   await p.waitForSelector(".mdd .menu__item");
   assert.deepEqual(await p.locator(".mdd__agent").evaluateAll((els) => els.map((e) => [e.textContent, e.dataset.state, e.getAttribute("aria-checked")])),
-    [["Claude Code", "ok", "true"], ["Codex", "bad", "false"], ["pi", "ok", "false"]], "every agent, with the status detect() gave");
+    [["Claude Code", "ok", "true"], ["Codex", "bad", "false"], ["pi", "ok", "false"], ["OpenCode", "ok", "false"], ["Custom", "bad", "false"]], "every agent, with the status detect() gave (Custom unconfigured, #813)");
   // an agent that is not ready says why and stays unchosen
   await agentTab(p, "Codex").click();
   assert.match(await p.locator(".mdd__note").innerText(), /Codex isn't ready: codex is not installed/);
@@ -764,7 +806,7 @@ await test("settings: Translate: the switch, the target language, and the model 
   assert.deepEqual(await model.locator("option").allInnerTexts(), ["Fastest available (recommended)", "Claude Opus", "Claude Sonnet", "Claude Haiku", "Claude Opus 4.1", "Claude Sonnet 4", "Claude Haiku 3.5"]);
   assert.equal(await model.inputValue(), "", "Fastest available is the default");
   await model.selectOption("haiku");
-  assert.deepEqual((await settings(p)).translateModel, { "claude-code": "haiku", codex: "", pi: "" }, "saved per agent");
+  assert.deepEqual((await settings(p)).translateModel, { "claude-code": "haiku", codex: "", pi: "", opencode: "" }, "saved per agent");
   assert.equal((await settings(p)).model["claude-code"], "", "the chat's model is another setting");
 
   // Another agent: its own models, and its own (default) choice.
@@ -834,11 +876,46 @@ await test("drop on the composer: dragover state without layout shift, chips add
   assert.equal(await p.locator(".cchips .chip:not(.chip--auto)").count(), 2, "an empty result adds nothing");
   await send(p, "what do these say?");
   await done(p);
-  assert.equal(await p.locator(".cchips .chip:not(.chip--auto)").count(), 2, "pinned drops stay after a send");
   assert.match(await sim(p, () => window.__zmc.sim.prompts[0].text), /Pager 2003[\s\S]*Lundberg 2021/);
-  await p.locator(".cchips .chip:not(.chip--auto) .chip__pin").first().click();
+  assert.equal(await p.locator(".cchips .chip:not(.chip--auto)").count(), 0, "sent once, they leave the composer");
+  assert.match(await p.locator(".msg--user .ubub__chips").innerText(), /Pager 2003[\s\S]*Lundberg 2021/, "the message shows them");
+  await send(p, "and now?");
+  await done(p);
+  assert.match(await sim(p, () => window.__zmc.sim.prompts[1].text), /Still open, unchanged[^\n]*Pager 2003/, "pinned drops are still named to the agent");
+  assert.equal(await p.locator(".msg--user").last().locator(".ubub__chips .chip").count(), 0, "and not shown again");
   await p.locator('button[aria-label="New chat"]').click();
   assert.equal(await p.locator(".cchips .chip:not(.chip--auto)").count(), 0, "a new chat starts clean");
+});
+
+// A picture as a File, the way a screenshot arrives on the clipboard (always "image.png") or a dragged file.
+const pictureData = (p, { w, h, name }) => p.evaluateHandle(async ([w, h, name]) => {
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const g = c.getContext("2d"); g.fillStyle = "#3a6"; g.fillRect(0, 0, w, h);
+  const blob = await new Promise((r) => c.toBlob(r, "image/png"));
+  const d = new DataTransfer(); d.items.add(new File([blob], name, { type: "image/png" })); return d;
+}, [w, h, name]);
+
+await test("a pasted or dropped picture becomes an image chip, scaled to 1568 px, sent once with the next message", async (p) => {
+  const shot = await pictureData(p, { w: 3200, h: 1000, name: "image.png" });
+  await p.evaluate((dt) => window.__zmc.shadow.querySelector(".cin").dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true })), shot);
+  await p.waitForSelector(".thumb .thumb__img");
+  assert.equal(await p.locator(".thumb").getAttribute("title"), "Image", "a screenshot's generic name is not shown");
+  await p.locator("button.thumb__main").click();
+  await p.waitForSelector(".lb .lb__img");
+  assert.equal(await p.locator(".lb .lnk").count(), 0, "a picture has no Go to Page");
+  await p.locator(".lb__x").click();
+  assert.equal(await p.locator(".cin").inputValue(), "", "no text was pasted");
+  const fig = await pictureData(p, { w: 40, h: 30, name: "figure-3.png" });
+  await fire(p, "drop", fig);
+  await p.waitForFunction(() => window.__zmc.shadow.querySelectorAll(".thumb").length === 2);
+  await send(p, "what is in these?");
+  await done(p);
+  const sent = await sim(p, () => window.__zmc.sim.prompts[0]);
+  assert.equal(sent.images.length, 2);
+  const sizes = await p.evaluate((imgs) => Promise.all(imgs.map(async (i) => { const b = await createImageBitmap(await (await fetch(`data:image/png;base64,${i.data}`)).blob()); return [b.width, b.height]; })), sent.images);
+  assert.deepEqual(sizes, [[1568, 490], [40, 30]], "the long edge is capped, small pictures keep their size");
+  assert.match(sent.text, /image: figure-3\.png/);
+  assert.equal(await p.locator(".thumb").count(), 0, "pictures are for that message only");
 });
 
 await test("a citation chip keeps its trailing punctuation: no line starts with a lone . , ; :", async (p) => {
@@ -904,7 +981,7 @@ await test("history: each chat shows its folder; Copy terminal command copies th
 await test("welcome: first run shows it instead of the chat; the checks settle one by one; a failing check is fixed in place; Start chatting hands over", async (p) => {
   assert.equal(await p.locator(".cin").isVisible(), false, "the chat is not showing yet");
   assert.match(await p.locator(".wel h2").innerText(), /Chat with your library/);
-  assert.equal(await p.locator(".wcard").count(), 3);
+  assert.equal(await p.locator(".wcard").count(), 5); // the four built-ins and the user-configured agent (#813)
   assert.equal(await p.locator(".wcard[aria-checked=true]").innerText().then((t) => t.split("\n")[0]), "Claude Code");
   await p.waitForSelector(".wrow--pending");
   await p.waitForSelector(".wrow--bad", { timeout: 4000 });
@@ -1131,6 +1208,36 @@ await test("a 400-turn chat opens fast and a streamed token stays cheap; the jum
 const dgFill = (sel, prop) => (p) => p.evaluate(([s, pr]) => getComputedStyle(window.__zmc.shadow.querySelector(s))[pr], [sel, prop]);
 const barOpacity = (p, i = 0) => p.evaluate((k) => getComputedStyle(window.__zmc.shadow.querySelectorAll(".dg__bar")[k]).opacity, i);
 
+const shadowText = (p, sel) => p.evaluate((q) => [...window.__zmc.shadow.querySelectorAll(q)].map((e) => e.textContent), sel);
+
+await test("callouts: numbered across the chat, a \\ref links to its card and flashes it, an unknown label says so", async (p) => {
+  await sim(p, () => { window.__zmc.sim.nextAnswer = "> [!definition] Metric\n> $d$ is a metric.\n\n\\begin{theorem}[Banach]\\label{thm:a}\nA fixed point exists.\n\\end{theorem}\n\n> [!tip]\n> unnumbered"; });
+  await send(p, "one");
+  await done(p);
+  await sim(p, () => { window.__zmc.sim.nextAnswer = "Using \\ref{thm:a}, and \\ref{def:none}.\n\n> [!lemma] L\n> body"; });
+  await send(p, "two");
+  await p.waitForFunction(() => window.__zmc.shadow.querySelectorAll('.msg--assistant[data-state="end_turn"]').length >= 2);
+  assert.deepEqual(await shadowText(p, ".cb__num"), [" 1", " 2", " 3"]);
+  assert.deepEqual(await shadowText(p, ".cbref"), ["Theorem 2", "def:none"]);
+  assert.equal(await p.locator(".cbref--missing").count(), 1);
+  await p.locator(".cbref").first().click();
+  assert.equal(await p.locator('.cb--thm.cb--flash').count(), 1);
+  assert.deepEqual(await sim(p, () => window.__zmc.shadow.querySelector(".cb--def").getAttribute("data-kind")), "definition");
+});
+
+await test("callouts: a card streams in as a card, never as raw markup", async (p) => {
+  await sim(p, () => { window.__zmc.sim.nextAnswer = "Here:\n\n\\begin{definition}[Metric space]\\label{def:m}\nA set with a map $d$ such that $d(x,y) = 0$ iff $x = y$, see \\ref{def:m}.\n\\end{definition}\n\n> [!theorem] Banach\n> Every contraction has a fixed point.\n\nDone."; });
+  await send(p, "stream it");
+  await p.waitForSelector(".md--streaming .cb", { timeout: 8000 });
+  for (let i = 0; i < 12 && await p.locator(".md--streaming").count(); i++) {
+    const t = (await shadowText(p, ".md")).join(" ");
+    assert.ok(!/\\begin|\\end|\[!|\\ref|\\label/.test(t), t);
+    await p.waitForTimeout(60);
+  }
+  await done(p);
+  assert.equal(await p.locator(".cb").count(), 2);
+}, { params: { speed: 40 } });
+
 await test("diagrams render as themed figures; the toolbar shows on hover and focus; Source toggles; Save calls the host", async (p) => {
   await send(p, "draw it");
   await done(p);
@@ -1188,6 +1295,32 @@ await test("a diagram streams as a quiet placeholder, never half drawn", async (
   await done(p);
   assert.equal(await p.locator(".dg--pending").count(), 0);
   assert.equal(await p.locator(".dg__fig svg").count(), 3);
+});
+
+await test("mermaid blocks render as figures (flowchart, sequence), stream as a placeholder, show their source; another type stays code", async (p) => {
+  await sim(p, () => { window.__zmc.sim.speed = 6; });
+  await send(p, "mermaid please");
+  await p.waitForSelector(".dg--pending", { timeout: 8000 });
+  await done(p);
+  assert.equal(await p.locator(".dg--pending").count(), 0);
+  assert.equal(await p.locator(".dg .dg__fig svg").count(), 2);
+  const texts = await p.locator(".dg__fig svg").evaluateAll((a) => a.map((s) => s.textContent));
+  assert.match(texts[0], /Research question[^]*Enough papers/);
+  assert.match(texts[1], /You[^]*Panel[^]*Agent/);
+  // colours are the theme's: nothing black, the styled node in the accent
+  const strokes = await p.evaluate(() => [...window.__zmc.shadow.querySelectorAll(".dg__fig svg rect")].map((r) => getComputedStyle(r).stroke));
+  assert.ok(strokes.length && strokes.every((c) => c !== "rgb(0, 0, 0)"), strokes.join(","));
+  // the pie chart is not drawn: it shows as a mermaid code block
+  assert.equal(await p.locator(".msg--assistant .code").count(), 1);
+  assert.match(await p.locator(".msg--assistant .code").innerText(), /pie title Sources/);
+  const src = p.locator(".dg").first().locator('button[aria-label="Show the Mermaid source"]');
+  await p.locator(".dg").first().hover();
+  await src.click();
+  assert.match(await p.locator(".dg").first().locator(".dg__src .code").innerText(), /flowchart TD[^]*Research question/);
+  await p.locator(".dg").first().locator('button[aria-label="Save as SVG"]').click();
+  await p.waitForFunction(() => window.__zmc.sim.saved.length === 1);
+  assert.match((await sim(p, () => window.__zmc.sim.saved))[0].head, /^<\?xml[^]*<svg /);
+  assert.deepEqual(p.errors, []);
 });
 
 await test("a hostile diagram is neutralised: no script runs, nothing external, only the drawing", async (p) => {
@@ -1315,8 +1448,8 @@ await test("explain better: only on the last finished answer; it asks again, int
   await p.locator('button[aria-label="Explain it better"]').click();
   await p.waitForFunction(() => window.__zmc.shadow.querySelectorAll('.msg--assistant[data-state="end_turn"]').length === 2);
   const last = (await sim(p, () => window.__zmc.sim.prompts)).at(-1).text;
-  assert.match(last, /<zotero-context>[\s\S]*<\/zotero-context>\n\nExplain that again from the intuition first, with a tiny example, then the details\.$/);
-  assert.equal(await p.locator(".ubub__text").last().innerText(), "Explain that again from the intuition first, with a tiny example, then the details.");
+  assert.match(last, /<zotero-context>[\s\S]*<\/zotero-context>\n\nExplain that again from the intuition first, with a tiny example, then the details, in the language of your last answer\.$/);
+  assert.equal(await p.locator(".ubub__text").last().innerText(), "Explain that again from the intuition first, with a tiny example, then the details, in the language of your last answer.");
   assert.equal(await p.locator('button[aria-label="Explain it better"]').count(), 1, "the earlier answer lost it");
   assert.equal(await p.locator('.msg--assistant').last().locator('button[aria-label="Explain it better"]').count(), 1);
 });
@@ -1637,6 +1770,7 @@ await test("Add skill: the full text, what is copied and what is left out, the s
 
 
 // no horizontal overflow at 300 px in any state: nothing may stick out of the panel except inside scroll containers
+// (the steps find their buttons by place, not by their English labels, since they also run in other languages)
 for (const [name, params, run] of [
   ["empty", {}, async () => {}],
   ["answer", {}, async (p) => { await send(p, "compare"); await done(p); await p.locator(".foot__src").click(); await p.locator(".step__row").first().click(); }],
@@ -1651,24 +1785,28 @@ for (const [name, params, run] of [
     const g = await p.evaluate(() => { const r = (s) => window.__zmc.shadow.querySelector(s).getBoundingClientRect(); const m = r(".mdd"), b = r(".pick--model"), c = r(".composer"); return { off: Math.abs(m.left - Math.max(c.left, Math.min(b.left - c.left, c.width - m.width) + c.left)), inside: m.right <= c.right + 1 }; });
     assert.ok(g.off < 3 && g.inside, "the dropdown opens above its own button, inside the composer");
   }],
-  ["diagram", {}, async (p) => { await send(p, "draw it"); await done(p); await p.locator(".dg").first().hover(); await p.locator(".dg").first().locator('button[aria-label="Show the SVG source"]').click(); }],
+  ["diagram", {}, async (p) => { await send(p, "draw it"); await done(p); await p.locator(".dg").first().hover(); await p.locator(".dg").first().locator(".dg__bar .iconbtn").first().click(); }],
   ["meter", {}, async (p) => { await p.evaluate(() => { window.__zmc.sim.contextUsage = { used: 176000, size: 200000 }; }); await send(p, "hello"); await done(p); await p.waitForSelector(".cnote:not([hidden])"); }],
-  ["popup", {}, async (p) => { await p.locator('button[aria-label="Add a source"]').click(); await p.waitForSelector(".pop__i"); }],
+  ["popup", {}, async (p) => { await p.locator(".ctools > .iconbtn").first().click(); await p.waitForSelector(".pop__i"); }],
   ["permission", { speed: 5 }, async (p) => { await send(p, "add a note"); await p.waitForSelector(".perm__opts"); }],
   ["error", {}, async (p) => { await send(p, "error"); await done(p, "error"); }],
-  ["history", {}, async (p) => { await p.locator('button[aria-label="History"]').click(); await p.waitForSelector(".hrow__main"); }],
-  ["settings", {}, async (p) => { await p.locator('button[aria-label="Settings"]').click(); await p.waitForTimeout(300); }],
-  ["skills card", {}, async (p) => { await p.locator('button[aria-label="Settings"]').click(); await p.waitForSelector(".sp"); await p.locator('button[aria-label="Edit /annotate-paper"]').click(); await p.waitForSelector(".sp__src"); await p.locator('button[aria-label="Edit Short summary"]').click(); }],
-  ["add skill", {}, async (p) => { await p.locator('button[aria-label="Settings"]').click(); await p.waitForSelector(".sp"); await p.getByRole("button", { name: "Add skill…" }).click(); await p.waitForSelector(".imp"); }],
+  ["history", {}, async (p) => { await p.locator(".hd > button").nth(2).click(); await p.waitForSelector(".hrow__main"); }],
+  ["settings", {}, async (p) => { await p.locator(".hd > button").last().click(); await p.waitForTimeout(300); }],
+  ["skills card", {}, async (p) => { await p.locator(".hd > button").last().click(); await p.waitForSelector(".sp"); await p.locator('.sp:has([title="/annotate-paper"]) .sp__acts .iconbtn').click(); await p.waitForSelector(".sp__src"); await p.locator('.sp:has([title="Short summary"]) .sp__acts .iconbtn').click(); }],
+  ["add skill", {}, async (p) => { await p.locator(".hd > button").last().click(); await p.waitForSelector(".sp"); await p.locator('[data-fid="sp:add"]').click(); await p.waitForSelector(".imp"); }],
   ["slash menu", {}, async (p) => { await sim(p, () => window.__zmc.sim.setSettingsElsewhere({ skills: { "annotate-paper": { slot: 4 } }, prompts: window.__zmc.host.getSettings().prompts.map((x) => (x.id === "p4" ? { ...x, slot: undefined } : x)) })); await p.locator(".cin").click(); await p.keyboard.type("/"); await p.waitForSelector(".pop--slash .pop__i"); }],
   ["start with", {}, async (p) => { await pinSkill(p); await LONG(p); await p.waitForFunction(() => /must truncate/.test(window.__zmc.shadow.querySelector(".pin__t").textContent)); }],
-  ["appearance", {}, async (p) => { await p.locator('button[aria-label="Settings"]').click(); await p.getByRole("button", { name: "Choose an image…" }).click(); await p.waitForSelector(".bgsw--image"); await p.locator('input[type="color"]').fill("#8a2be2"); await p.waitForFunction(() => window.__zmc.shadow.querySelector(".hex")); }],
+  ["appearance", {}, async (p) => { await p.locator(".hd > button").last().click(); await p.locator('[data-fid="image:choose"]').click(); await p.waitForSelector(".bgsw--image"); await p.locator('input[type="color"]').fill("#8a2be2"); await p.waitForFunction(() => window.__zmc.shadow.querySelector(".hex")); }],
   ["status", { doctor: "many" }, async (p) => { await p.locator(".stat").click(); await p.waitForSelector(".check"); }],
   ["setup", { doctor: "many" }, async (p) => { await p.locator(".setup").waitFor(); }],
   ["welcome", { welcome: "1", doctor: "many" }, async (p) => { await p.waitForSelector(".wrow--bad"); await p.waitForFunction(() => !window.__zmc.shadow.querySelector(".wrow--pending")); await p.locator(".wrow--bad .btn").first().click(); await p.waitForTimeout(500); }],
 ]) {
   for (const width of [300, 320]) for (const dark of [false, true]) {
     await test(`no overflow at ${width}px ${dark ? "dark" : "light"}: ${name}`, async (p) => { await run(p); await p.waitForTimeout(150); assert.deepEqual(await p.evaluate(OVERFLOW), []); }, { width, dark, params });
+  }
+  // the longest languages (German, French: about 30% longer than English) and the CJK ones, at the narrowest width
+  for (const lang of ["de-DE", "fr-FR", "pt-BR", "ja-JP", "zh-TW"]) {
+    await test(`no overflow at 300px in ${lang}: ${name}`, async (p) => { await run(p); await p.waitForTimeout(150); assert.deepEqual(await p.evaluate(OVERFLOW), []); }, { width: 300, params: { ...params, lang } });
   }
 }
 

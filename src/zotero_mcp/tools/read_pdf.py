@@ -7,14 +7,11 @@ import unicodedata
 from contextlib import contextmanager
 from typing import Literal
 
-from fastmcp import Context
-from fastmcp.utilities.types import Image
-from fastmcp.exceptions import ToolError
-
 from zotero_mcp import client as _client
 from zotero_mcp import library as _library
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
+from zotero_mcp._context import Context, ToolError
 from zotero_mcp.config import load_config
 from zotero_mcp.extract import extract_pdf, pdf_page_count
 from zotero_mcp.tools import _helpers
@@ -198,14 +195,16 @@ _IMAGE_HINTS = {
 
 @mcp.tool(
     name="zotero_read_pdf_pages",
-    description="Read specific page range(s) from a PDF attachment of a Zotero item. "
-    "Use this when you know which pages to read — for example after getting the PDF "
-    "outline via zotero_get_pdf_outline. Pages are 1-indexed. "
-    "format='text' (default) returns Markdown with the heading structure preserved and "
-    "flags pages whose equations, figures or tables the text garbles. "
-    "format='image' returns the pages as PNG images (up to 10) so those can be read "
-    "exactly; rect=[x, y, width, height] (normalized 0-1, e.g. from "
-    "zotero_get_page_layout) returns just that region of start_page, zoomed in.",
+    description=(
+        "Read chosen pages of an item's PDF, e.g. after "
+        "zotero_get_pdf_outline. item_key: the paper or its PDF attachment. "
+        "Reads start_page through end_page (1-indexed; omit end_page for one "
+        "page). format='text' (default) returns Markdown and flags pages "
+        "whose equations, figures or tables the text garbles; format='image' "
+        "returns PNG page images (up to 10) to read those exactly. rect=[x, "
+        "y, width, height] (normalized 0-1, e.g. from zotero_get_page_layout) "
+        "returns just that region of start_page, zoomed in."
+    ),
     # Text or a list of text and images, so no single structured schema fits.
     output_schema=None,
 )
@@ -229,6 +228,8 @@ def read_pdf_pages(
         ctx: MCP context.
     """
     if format == "image":
+        from fastmcp.utilities.types import Image
+
         header, pages = render_pdf_pages(item_key, start_page, end_page, rect=rect, ctx=ctx)
         return [header, *(Image(data=page["png"], format="png") for page in pages)]
     if format != "text":
@@ -586,8 +587,7 @@ def _garbled_content_flags(pdf_path: str, doc) -> dict[int, str]:
     the read simply carries no flags.
     """
     try:
-        import fitz
-
+        from zotero_mcp._pymupdf import fitz
         from zotero_mcp.pdf_layout import _parse_caption_block, scan_math
 
         pdf = fitz.open(pdf_path)
@@ -653,7 +653,7 @@ def render_pdf_pages(
                 code="invalid_page_range",
             )
     try:
-        import fitz
+        from zotero_mcp._pymupdf import fitz
     except ImportError as exc:
         raise PdfReadError(
             f"Rendering pages requires PyMuPDF. {_utils.install_hint('pdf')}",
