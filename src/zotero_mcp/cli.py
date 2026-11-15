@@ -545,6 +545,51 @@ def _print_update_stats(stats: dict) -> None:
             print("  zotero-mcp batch-import")
 
 
+def print_keyword_status(status: dict | None) -> None:
+    """The keyword passage index lines of `db-status`; nothing when it is unused."""
+    if not status or not (status.get("enabled") or status.get("exists")):
+        return
+    mode = " (keyword only, no embeddings)" if status.get("keyword_only") else ""
+    print(f"\nKeyword passage index: {'enabled' if status.get('enabled') else 'disabled'}{mode}")
+    print(f"- Path: {status.get('path')}")
+    if status.get("error"):
+        print(f"- Error: {status['error']}")
+    elif not status.get("exists"):
+        print("- Not built yet: run 'zotero-mcp update-db --keyword-only' (local mode)")
+    else:
+        print(f"- Items: {status.get('items', 0)} ({status.get('items_with_fulltext', 0)} with full text)")
+        print(f"- Passages: {status.get('passages', 0)}")
+        print(f"- Size: {status.get('size_bytes', 0) / 1e6:,.0f} MB")
+
+
+def _print_keyword_stats(stats: dict) -> None:
+    outcome = "failed" if stats.get("error") else "skipped" if stats.get("skipped_reason") else "completed"
+    print(f"\nKeyword index update {outcome}:")
+    if stats.get("error"):
+        print(f"- Error: {stats['error']}")
+        return
+    if stats.get("skipped_reason"):
+        print(f"- Skipped: {stats.get('skipped_message') or stats['skipped_reason']}")
+        return
+    print(f"- Items scanned: {stats.get('total_items', 0)}")
+    print(f"- Indexed with full text: {stats.get('indexed_items', 0)}")
+    print(f"- Indexed from metadata (no attachment): {stats.get('metadata_only_items', 0)}")
+    if stats.get("failed_items"):
+        print(f"- Attachment gave no text (metadata indexed; retried when the item changes): "
+              f"{stats['failed_items']}")
+    print(f"- Unchanged: {stats.get('unchanged_items', 0)}")
+    print(f"- Removed (no longer in Zotero): {stats.get('deleted_items', 0)}")
+    if stats.get("deletion_skipped_reason"):
+        print(f"- Deletion check skipped: {stats['deletion_skipped_reason']}")
+    print(f"- Passages written: {stats.get('passages_written', 0)}")
+    print(f"- Errors: {stats.get('errors', 0)}")
+    if index := stats.get("index"):
+        size_mb = index.get("size_bytes", 0) / 1e6
+        print(f"- Index: {index.get('items', 0)} items, {index.get('passages', 0)} passages, "
+              f"{size_mb:,.0f} MB at {index.get('path')}")
+    print(f"- Duration: {stats.get('duration', 'Unknown')}")
+
+
 def _detect_batch_provider(search) -> str:
     """Infer which provider's manifests to read from the configured model."""
     from zotero_mcp.embeddings.registry import batch_capable_providers
@@ -847,6 +892,8 @@ def add_update_db_arguments(parser) -> None:
                                  help="Parse N attachments in parallel during --fulltext "
                                       "(default: semantic_search.extraction.workers, or 1 for "
                                       "sequential). Capped at the CPU count")
+    parser.add_argument("--keyword-only", action="store_true",
+                                 help="Update only the keyword passage index: no embeddings (local mode)")
     parser.add_argument("--clear-fulltext-cache", action="store_true",
                                  help="Discard the transient extracted-fulltext cache before "
                                       "running, forcing every attachment to be re-parsed")
@@ -944,6 +991,15 @@ def run_update_db(args) -> None:
         removed = fulltext_cache.clear_all(config_path=str(config_path))
         print(f"Cleared transient fulltext cache ({removed} entries)")
 
+    from zotero_mcp.keyword_index import load_keyword_config
+
+    keyword_only = bool(
+        getattr(args, "keyword_only", False) or load_keyword_config(str(config_path)).get("keyword_only")
+    )
+    if keyword_only:
+        _run_keyword_only_update(args, config_path, db_path)
+        return
+
     try:
         # Create semantic search instance with optional db_path override
         search = create_semantic_search(
@@ -990,9 +1046,13 @@ def run_update_db(args) -> None:
         )
 
         _print_update_stats(stats)
+        if stats.get("keyword_index"):
+            _print_keyword_stats(stats["keyword_index"])
 
         if stats.get('error'):
             print(f"Error: {stats['error']}")
+            sys.exit(1)
+        if (stats.get("keyword_index") or {}).get("error"):
             sys.exit(1)
 
         # Best-effort sweep so the transient cache cannot outlive the runs
@@ -1013,6 +1073,40 @@ def run_update_db(args) -> None:
 
     except Exception as e:
         print(f"Error updating database: {e}")
+        sys.exit(1)
+
+
+def _run_keyword_only_update(args, config_path: Path, db_path: str | None) -> None:
+    """`update-db --keyword-only`: the keyword passage index alone, no embeddings."""
+    from zotero_mcp.semantic_search import create_semantic_search
+    from zotero_mcp.utils import is_local_mode
+
+    if not is_local_mode():
+        print(
+            "Error: the keyword passage index needs local mode, since it reads "
+            "zotero.sqlite and the attachment files directly.\n"
+            "Set ZOTERO_LOCAL=true or run 'zotero-mcp setup' to enable local mode.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        search = create_semantic_search(
+            str(config_path),
+            db_path=db_path,
+            extraction_workers=getattr(args, "extraction_workers", None),
+            keyword_only=True,
+        )
+        print("Updating the keyword passage index (no embeddings)...")
+        stats = search.update_keyword_index(
+            force_rebuild=args.force_rebuild,
+            limit=args.limit,
+            allow_mass_deletion=args.allow_mass_deletion,
+        )
+    except Exception as e:
+        print(f"Error updating the keyword index: {e}")
+        sys.exit(1)
+    _print_keyword_stats(stats)
+    if stats.get("error"):
         sys.exit(1)
 
 
@@ -1468,6 +1562,7 @@ def main():
             print(f"Should update: {status.get('should_update', False)}")
             print("\nConfiguration:")
             _print_semantic_config(status, config_path, "- ")
+            print_keyword_status(status.get("keyword_index"))
 
             if collection_info.get("unreadable"):
                 from zotero_mcp.chroma_client import unreadable_index_message

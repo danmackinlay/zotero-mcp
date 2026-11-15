@@ -11,6 +11,8 @@ pip install "zotero-mcp-server[semantic]"
 - **Similarity scores** with each result
 - **Auto-updating database** with configurable sync schedules
 
+For looking up where distinctive words appear (a theorem by name, an author's construction), there is also a [keyword passage index](configuration.md#keyword-passage-search): BM25 over the same passages, built on the CPU with no embedding model (`zotero-mcp update-db --keyword-only`), searched with `zotero_keyword_search` or `zotero-cli search --mode keyword`.
+
 ## Setup
 
 During setup or separately, configure semantic search:

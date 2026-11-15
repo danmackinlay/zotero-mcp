@@ -1553,6 +1553,15 @@ class LocalZoteroReader:
             return None
         return target, keys.get(target, "")
 
+    def extraction_attachment_key(self, item_id: int) -> str | None:
+        """Key of the attachment whose file extraction reads for an item, or None.
+
+        The keyword passage index records it, so a hit's page numbers can be
+        passed to ``zotero_read_pdf_pages`` with the exact file they came from.
+        """
+        chosen = self._resolve_extraction_target(item_id)
+        return (chosen[1] or None) if chosen else None
+
     def _cache_profile(self) -> str:
         """Extraction settings that change the text produced for one file.
 

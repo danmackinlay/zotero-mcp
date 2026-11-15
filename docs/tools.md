@@ -30,6 +30,7 @@ group name is an error at startup rather than a silent no-op.
 | `scite` | off | Scite citation tallies and retraction checks (calls scite.ai; pairs with the `[scite]` extra) |
 | `duplicates` | off | Find and merge duplicate items — library maintenance |
 | `semantic` | **on** | `zotero_semantic_search` (needs the `[semantic]` extra) |
+| `keyword` | off | `zotero_keyword_search` — BM25 passage search for distinctive words, no embeddings ([keyword passage search](configuration.md#keyword-passage-search)) |
 | `discovery` | off | `find_related_papers`, `library_coverage` — corpus-level exploration via OpenAlex |
 | `feeds` | off | Zotero RSS feed subscriptions |
 | `relations` | off | Explicit item-to-item "related items" links |
@@ -92,8 +93,9 @@ Example (Claude Desktop / Claude Code):
 - `zotero_get_collection_items`: Items in one collection, paged
 - `zotero_search_collections`: Find collections by name to get their keys
 
-### 🧠 Semantic search tools (`semantic`, `search-admin`)
+### 🧠 Semantic search tools (`semantic`, `search-admin`, `keyword`)
 - `zotero_semantic_search`: Find papers by meaning with embeddings
+- `zotero_keyword_search`: Find the passages of your PDFs that contain distinctive words (theorem names, authors, technical terms), ranked by BM25, with the pages to read; needs the keyword index (`zotero-mcp update-db --keyword-only`) and no embedding model (`keyword`)
 - `zotero_update_search_database`: Build or refresh the index
 - `zotero_get_search_database_status`: Index state and configuration
 

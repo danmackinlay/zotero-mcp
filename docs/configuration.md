@@ -118,6 +118,9 @@ Environment variables set in the shell you launch a client from (for example `cl
 - `GEMINI_BASE_URL`: Custom Gemini endpoint URL (optional, for use with compatible APIs)
 - `OLLAMA_EMBEDDING_MODEL`: Ollama embedding model name (qwen3-embedding by default)
 - `OLLAMA_BASE_URL`: Ollama server URL (default: http://localhost:11434)
+- `ZOTERO_ONNX_THREADS`: Thread count for the default model's ONNX Runtime (optional).
+  Where zotero-mcp may run on only some CPUs (a container's cpuset, a Slurm job, taskset),
+  set it to that number of CPUs to stop the `pthread_setaffinity_np failed` errors
 - `ZOTERO_DB_PATH`: Custom `zotero.sqlite` path (optional). When unset, the
   database is located automatically: a data directory configured in Zotero's
   preferences (read from the profile's `prefs.js`) is tried first, then the
@@ -256,7 +259,7 @@ PDFs are parsed with [pdf-inspector](https://github.com/firecrawl/pdf-inspector)
 
 | Key | Default | What it does |
 |---|---|---|
-| `pdf_max_pages` | `50` | Pages extracted per PDF when indexing. Raising it does not widen what search sees on its own — that is bounded by the embedding model's token limit or `chunking.max_chunks_per_item`. |
+| `pdf_max_pages` | `50` | Pages extracted per PDF when indexing. Raising it does not widen what search sees on its own — that is bounded by the embedding model's token limit or `chunking.max_chunks_per_item`. The [keyword index](#keyword-passage-search) has no such bound and can take its own `keyword_index.pdf_max_pages`. |
 | `fulltext_display_max_pages` | `10` | Pages returned by `zotero_get_item_fulltext`. Separate from the above because reading a paper is bounded by your assistant's context, not by recall. |
 | `attachment_priority` | `["pdf", "html", "other"]` | Order in which attachment kinds are tried when an item has several readable files. |
 | `converted_pages_dir` | none | Folder of page text converted outside zotero-mcp, laid out as `<dir>/<ATTACHMENT_KEY>/pages/<n>.md` (`n` is the page of the PDF, from 1). `zotero_read_pdf_pages` returns a page's file from there instead of the text layer, which loses math and has nothing for a scan. `ZOTERO_CONVERTED_PAGES_DIR` overrides it. |
@@ -315,6 +318,49 @@ An index built with chunking on by an earlier version holds its passages in `zot
 A passage longer than the model can read would lose its tail, so `chunk_size` is lowered to fit: about 85% of the model's token limit, at 4 characters per token (3 for OpenAI). For the default model that is roughly 870 characters per passage whatever `chunk_size` says. Models with a larger limit keep your `chunk_size`, and the change is logged once at info level.
 
 With the default model, 20 passages cover about 13,000 characters, a few pages. To index whole papers, raise `max_chunks_per_item`: 100 covers roughly 20 pages, and longer papers need more. Each passage is one vector, so the database grows with it.
+
+<a id="keyword-passage-search"></a>
+
+## Keyword passage search
+
+A keyword index finds the passages of your PDFs that contain given words, ranked by BM25. It needs no embedding model and no GPU: it is built on the CPU from the same extracted text and the same passage splitter as passage chunking, and kept in a SQLite file ([FTS5](https://www.sqlite.org/fts5.html)) next to the ChromaDB directory. It suits looking up a named result (a theorem, a lemma, an inequality, an author's construction), where the words are known and distinctive. On a pilot of 25 theorem-lookup queries over a mathematics library it found the right passage in the top 10 about as often as small embedding models, without embedding anything. For a topic described in your own words, semantic search is still the tool.
+
+It is off by default. These keys live under `semantic_search.keyword_index`:
+
+```json
+{
+  "semantic_search": {
+    "keyword_index": {
+      "enabled": true,
+      "keyword_only": false,
+      "max_chunks_per_item": 0,
+      "pdf_max_pages": 2000
+    }
+  }
+}
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `enabled` | `false` | Keep the keyword index up to date after every `update-db` (and the server's automatic updates), alongside the embeddings. |
+| `keyword_only` | `false` | Build only the keyword index: `update-db` embeds nothing, loads no model and leaves ChromaDB alone. The same as `update-db --keyword-only` on every run. Implies `enabled`. |
+| `max_chunks_per_item` | `0` | Passages kept per item; `0` keeps them all. Separate from `chunking.max_chunks_per_item`, which caps the embedding index at 20 by default (about 28,000 characters, a fraction of a book). |
+| `pdf_max_pages` | `extraction.pdf_max_pages` (50) | Pages extracted per PDF for this index. Raise it to index whole books; a higher cap costs extraction time and disk space, not embedding time. |
+| `path` | beside ChromaDB | The index file. By default `~/.config/zotero-mcp/chroma_db-keyword.sqlite3`, or `<persist_directory>-keyword.sqlite3`. |
+
+Passage size and overlap come from `chunking.chunk_size` and `chunking.overlap` (1,500 and 200 characters), whether or not chunking is enabled. Unlike embedding passages they are never shortened to fit a model.
+
+The keyword index reads `zotero.sqlite` and the attachment files directly, so it needs local mode (`ZOTERO_LOCAL=true`). Building it goes through `update-db`, which needs the `[semantic]` extra installed, though no model is loaded; searching it needs nothing beyond the base install. To build it without any embedding model:
+
+```bash
+zotero-mcp update-db --keyword-only
+```
+
+With `collection_keys` set, the index covers those collections, like the embedding index. Run the same command again whenever you like: it keeps its own record of what each item was built from and extracts an item again only when its modification date, its attachments, `attachment_priority` or the settings above change, and it removes items no longer in the library. An attachment that gives no text is indexed by its title and authors and not parsed again until something changes. `--force-rebuild` empties the index first, and `--extraction-workers N` parses N files in parallel. With `enabled` (and not `keyword_only`), `update-db` runs the keyword update after the embedding update; items that changed are then parsed twice, once for each index.
+
+Search it with `zotero_keyword_search` (in the opt-in `keyword` toolset: `ZOTERO_MCP_TOOLSETS=default,keyword`; with `keyword_only`, `default,-semantic,keyword` also leaves out `zotero_semantic_search`, which would load the default embedding model to embed each query against an empty index) or `zotero-cli search --mode keyword "Banach-Steinhaus"`. Any of the words may match, and passages with more of the rarer words come first; word endings and accents are ignored (`theorems` finds `theorem`, `Erdos` finds `Erdős`), hyphenated names match whichever dash the PDF used, and a phrase in double quotes must appear as written. Common English words are dropped, and LaTeX Greek letters (`\sigma`) match the letter. Each result is one passage per item, with the item key, the PDF's attachment key and the pages the passage spans when the text has page breaks, so it can go straight to `zotero_read_pdf_pages`. Text from Zotero's own full-text cache (used when a file cannot be parsed) has no page breaks, so those hits give a passage number instead.
+
+The index costs disk space roughly twice the size of the extracted text: around 2.5 KB per passage, so a library of half a million pages at 50 pages per PDF is a few GB. `zotero-mcp db-status` and `zotero_get_search_database_status` show its counts.
 
 <a id="semantic-search-memory"></a>
 
@@ -377,6 +423,7 @@ zotero-mcp update-db --fulltext            # Update with full-text extraction (c
 zotero-mcp update-db --force-rebuild       # Force complete database rebuild
 zotero-mcp update-db --fulltext --force-rebuild  # Rebuild with full-text extraction
 zotero-mcp update-db --fulltext --db-path "your_path_to/zotero.sqlite" # Customize your zotero database path
+zotero-mcp update-db --keyword-only        # Build only the keyword (BM25) passage index; no embedding model
 zotero-mcp db-status                       # Show database status and info
 
 # General
