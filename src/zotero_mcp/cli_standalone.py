@@ -1255,6 +1255,9 @@ def cmd_db(args):
         print(f"- Last update: {uc.get('last_update', 'Never')}")
         print(f"- Should update: {status.get('should_update', False)}")
         print(f"- OpenAI Batch API: {'active' if bc.get('active') else 'inactive'}")
+        from zotero_mcp.index_exclusions import describe_config_file
+
+        print(f"- Excluded collections: {describe_config_file(config_path)}")
         print(f"- Passage chunking: {_format_chunking_status(status)}")
         print_keyword_status(status.get("keyword_index"))
         if ci.get("unreadable"):

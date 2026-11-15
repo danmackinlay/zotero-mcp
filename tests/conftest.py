@@ -108,6 +108,8 @@ def isolate_local_write_state(monkeypatch, tmp_path):
         "ZOTERO_WEBDAV_URL",
         "ZOTERO_WEBDAV_USERNAME",
         "ZOTERO_WEBDAV_PASSWORD",
+        # A developer's own exclusions would make updates under test refuse to run.
+        "ZOTERO_EXCLUDE_COLLECTIONS",
     ):
         monkeypatch.delenv(var, raising=False)
 

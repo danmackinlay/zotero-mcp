@@ -500,6 +500,15 @@ def _print_repair_report(report) -> None:
     print(f"  When search works, delete the old index: {report.broken_directory}")
 
 
+def _excluded_by(stats: dict) -> str:
+    """The collections an update excluded, as ``'name' (KEY)`` for each."""
+    names = [
+        f"'{c.get('collection_name')}' ({c.get('collection_key')})"
+        for c in stats.get("excluded_collections") or []
+    ]
+    return ", ".join(names) or "no collection"
+
+
 def _print_update_stats(stats: dict) -> None:
     is_batch = stats.get("batch_mode") or stats.get("batch_submitted")
     batch_provider = stats.get("batch_provider", "openai")
@@ -521,6 +530,10 @@ def _print_update_stats(stats: dict) -> None:
         print(f"- Added: {stats.get('added_items', 0)}")
         print(f"- Updated: {stats.get('updated_items', 0)}")
     print(f"- Skipped: {stats.get('skipped_items', 0)}")
+    if "excluded_items" in stats:
+        print(f"- Excluded (exclude_collections): {stats['excluded_items']} items, by {_excluded_by(stats)}")
+    if stats.get("purged_excluded_items"):
+        print(f"- Removed from the index as excluded: {stats['purged_excluded_items']} items")
     print(f"- Errors: {stats.get('errors', 0)}")
     print(f"- Duration: {stats.get('duration', 'Unknown')}")
     if stats.get("batch_submitted"):

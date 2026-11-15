@@ -31,7 +31,7 @@ except Exception:
     tiktoken = None
 
 
-from . import batch_common, chroma_worker, fulltext_cache, gemini_batch, openai_batch
+from . import batch_common, chroma_worker, fulltext_cache, gemini_batch, index_exclusions, openai_batch
 from .chroma_client import (
     ChromaClient,
     create_chroma_client,
@@ -1387,6 +1387,9 @@ class ZoteroSemanticSearch:
     _held_text: _HeldText | None = None
     # Items whose old passages could not be deleted in the article pass, set per run.
     _undropped_passages: set[str] = frozenset()
+    # What semantic_search.exclude_collections keeps out, resolved per run by
+    # update_database; None when nothing is excluded.
+    _exclusions: index_exclusions.Exclusions | None = None
     # A gap fill waiting for full text Zotero did not have is asked for it again
     # after this many days, doubling after each answer without text, up to the
     # cap. Zotero indexes PDFs some time after they are added.
@@ -2231,6 +2234,19 @@ class ZoteroSemanticSearch:
                 local_items = reader.get_items_with_text(limit=limit, include_fulltext=False, collection_keys=collection_keys)
                 if excluded_keys:
                     local_items = [it for it in local_items if it.key not in excluded_keys]
+                if self._exclusions is not None:
+                    # exclude_collections, re-read on this scan's connection
+                    # (it may see items filed since the run began) and merged,
+                    # so nothing excluded earlier comes back. Dropped before
+                    # any attachment is looked up.
+                    self._exclusions = self._exclusions.merge(
+                        index_exclusions.resolve_via_local(self._exclusions.entries, reader)
+                    )
+                    exclusions = self._exclusions
+                    local_items = [
+                        it for it in local_items
+                        if not exclusions.excludes(key_group_map.get(it.key), it.key)
+                    ]
                 candidate_count = len(local_items)
                 sys.stderr.write(f"Found {candidate_count} candidate items.\n")
 
@@ -2582,6 +2598,8 @@ class ZoteroSemanticSearch:
                 logger.info(f"Retrieved {len(api_items)} items from local database")
                 return api_items
 
+        except index_exclusions.ExcludedCollectionsError:
+            raise
         except Exception as e:
             logger.error(f"Error reading from local database: {e}")
             logger.info("Falling back to API...")
@@ -2633,6 +2651,7 @@ class ZoteroSemanticSearch:
         """
         if library_keys is None:
             return []
+        self._cover_run_library()
         waiting = set(self.update_config.get("gaps_waiting_for_text") or [])
         skipped = self._still_waiting_for_text(include_fulltext)
         items: list[dict[str, Any]] = []
@@ -2641,6 +2660,8 @@ class ZoteroSemanticSearch:
                 continue
             if key not in library_keys:
                 # Another library's item: its own library's run asks about it.
+                continue
+            if self._excluded_item({"key": key}):
                 continue
             if not include_fulltext:
                 # No run without text can fill this; don't fetch the item to find out.
@@ -2656,6 +2677,8 @@ class ZoteroSemanticSearch:
                 continue
             if not item or item.get("data", {}).get("itemType") in _NON_INDEXED_ITEM_TYPES:
                 self._note_unanswered_recheck(key, waiting)
+                continue
+            if self._excluded_item(item):
                 continue
             item["_index_levels"] = gaps[key]
             items.append(item)
@@ -3000,6 +3023,13 @@ class ZoteroSemanticSearch:
         total = len(items)
         if not total:
             return
+        # Every caller drops excluded items first; reaching here with one is a
+        # bug, and asking Zotero for its text is the leak the setting forbids.
+        if self._exclusions is not None and any(self._excluded_item(it) for it in items):
+            raise index_exclusions.ExcludedCollectionsError(
+                "An item in an excluded collection reached the full-text fetch; stopping "
+                "the update without fetching it. Please report this as a bug."
+            )
         try:
             sys.stderr.write(f"\nFetching fulltext for {total} items via web API...\n")
             sys.stderr.flush()
@@ -3061,6 +3091,128 @@ class ZoteroSemanticSearch:
         for item in items:
             item.setdefault("data", {})["group_id"] = group_id
 
+    # -- semantic_search.exclude_collections (see index_exclusions) ----------
+
+    def _configured_zotero_db_path(self) -> str | None:
+        """The Zotero database path: the CLI override, else the config's."""
+        if self.db_path:
+            return self.db_path
+        try:
+            if self.config_path and os.path.exists(self.config_path):
+                with open(self.config_path) as f:
+                    return (json.load(f).get("semantic_search") or {}).get("zotero_db_path")
+        except Exception:
+            pass
+        return None
+
+    def _resolve_exclusions(self, *, local_scan: bool) -> index_exclusions.Exclusions | None:
+        """This run's exclusions, None when none are configured.
+
+        A local scan resolves against every library in ``zotero.sqlite``, an
+        API run against the one library the client reads. Raises
+        :class:`index_exclusions.ExcludedCollectionsError` when they cannot be resolved.
+        """
+        entries = index_exclusions.configured_entries(self.config_path)
+        if not entries:
+            return None
+        if not local_scan:
+            return index_exclusions.resolve_via_api(
+                entries, self.zotero_client, self._pinned_group_id(), _paginate
+            )
+        try:
+            with suppress_stdout(), LocalZoteroReader(db_path=self._configured_zotero_db_path()) as reader:
+                return index_exclusions.resolve_via_local(entries, reader)
+        except index_exclusions.ExcludedCollectionsError:
+            raise
+        except Exception as e:
+            raise index_exclusions.ExcludedCollectionsError(
+                f"exclude_collections: could not read the local Zotero database ({e}). "
+                "Refusing to update the index rather than index without the exclusion."
+            ) from e
+
+    def _cover_run_library(self) -> None:
+        """Extend the exclusions to the library the Zotero client reads, if they miss it.
+
+        A local scan resolves against ``zotero.sqlite``; when it falls back to
+        the API, the client's library may not be one of those it resolved.
+        """
+        exclusions = self._exclusions
+        if exclusions is None or self._pinned_group_id() in exclusions.libraries:
+            return
+        self._exclusions = exclusions.merge(
+            index_exclusions.resolve_via_api(
+                exclusions.entries, self.zotero_client, self._pinned_group_id(), _paginate
+            )
+        )
+
+    def _excluded_item(self, item: dict[str, Any], *, by_item_library: bool = False) -> bool:
+        """Whether an exclusion covers ``item``: by key, parent, or its own collections.
+
+        An API item belongs to the client's library. ``by_item_library``
+        reads the library from ``data.group_id`` instead, where an unknown
+        one checks every library.
+        """
+        exclusions = self._exclusions
+        if exclusions is None:
+            return False
+        data = item.get("data") or {}
+        group_id = data.get("group_id") if by_item_library else self._pinned_group_id()
+        return exclusions.excludes(
+            group_id,
+            item.get("key") or data.get("key"),
+            data.get("collections"),
+            data.get("parentItem"),
+        )
+
+    def _drop_excluded(
+        self, items: list[dict[str, Any]], *, by_item_library: bool = False
+    ) -> list[dict[str, Any]]:
+        if self._exclusions is None:
+            return items
+        return [it for it in items if not self._excluded_item(it, by_item_library=by_item_library)]
+
+    def _purge_excluded_items(self, stats: dict[str, Any]) -> None:
+        """Delete every indexed record, article or passage, of an excluded item.
+
+        Scoped by library like the deletion pass; a record with no library at
+        all (indexed before #163, never attributed) goes too. The transient
+        full-text cache of those items is dropped as well.
+        """
+        exclusions = self._exclusions
+        if exclusions is None:
+            return
+        excluded = set().union(*(exclusions.item_keys(g) for g in exclusions.libraries))
+        if not excluded:
+            return
+        purged: set[str] = set()
+        for group_id in sorted(exclusions.libraries):
+            keys = exclusions.item_keys(group_id)
+            if not keys:
+                continue
+            ids = sorted(
+                doc_id for doc_id in self.chroma_client.get_all_ids(where={"group_id": int(group_id)})
+                if doc_id.split("#", 1)[0] in keys
+            )
+            if ids:
+                self.chroma_client.delete_documents(ids)
+                purged.update(doc_id.split("#", 1)[0] for doc_id in ids)
+        unattributed = []
+        for doc_id in sorted(self.chroma_client.get_all_ids()):
+            if doc_id.split("#", 1)[0] in excluded:
+                meta = self.chroma_client.get_document_metadata(doc_id)
+                if meta is not None and "group_id" not in meta:
+                    unattributed.append(doc_id)
+        if unattributed:
+            self.chroma_client.delete_documents(unattributed)
+            purged.update(doc_id.split("#", 1)[0] for doc_id in unattributed)
+        try:
+            fulltext_cache.evict_many(sorted(excluded), config_path=self.config_path)
+        except Exception as e:
+            logger.debug(f"Fulltext cache eviction for excluded items failed: {e}")
+        if purged:
+            stats["purged_excluded_items"] = len(purged)
+            _report(f"Removed {len(purged)} item(s) in excluded collections from the index.\n")
+
     def _get_items_from_api(self, limit: int | None = None, include_fulltext: bool = False) -> list[dict[str, Any]]:
         """
         Get items from Zotero API (original implementation).
@@ -3076,6 +3228,7 @@ class ZoteroSemanticSearch:
             List of items from API
         """
         logger.info("Fetching items from Zotero API...")
+        self._cover_run_library()
 
         # Fetch items in batches to handle large libraries
         batch_size = 100
@@ -3114,6 +3267,8 @@ class ZoteroSemanticSearch:
             if len(items) < batch_size:
                 break
 
+        # Before any attachment is looked at (exclude_collections).
+        all_items = self._drop_excluded(all_items)
         if limit:
             all_items = all_items[:limit]
 
@@ -3144,6 +3299,7 @@ class ZoteroSemanticSearch:
             once turned a transient API failure into a full index wipe).
         """
         logger.info(f"Fetching changed items since library version {since_version}...")
+        self._cover_run_library()
         try:
             changed_versions = self.zotero_client.item_versions(since=since_version) or {}
         except Exception as e:
@@ -3164,12 +3320,14 @@ class ZoteroSemanticSearch:
 
         changed_items: list[dict[str, Any]] = []
         for key in changed_versions.keys():
+            if self._excluded_item({"key": key}):
+                continue
             try:
                 item = self.zotero_client.item(key)
             except Exception as e:
                 logger.debug(f"item({key}) failed during incremental fetch: {e}")
                 continue
-            if not item:
+            if not item or self._excluded_item(item):
                 continue
             item_type = item.get("data", {}).get("itemType")
             # Don't index attachments/notes as standalone entries; only
@@ -3817,6 +3975,16 @@ class ZoteroSemanticSearch:
                     stats["end_time"] = end_time.isoformat()
                     return stats
 
+            # semantic_search.exclude_collections, resolved before anything is
+            # fetched, reset or indexed. An entry that matches no collection, or
+            # a membership that cannot be read, raises and stops the run here:
+            # the setting fails closed, never into "nothing excluded".
+            self._exclusions = self._resolve_exclusions(local_scan=extract_fulltext)
+            if self._exclusions is not None:
+                stats["excluded_items"] = self._exclusions.excluded_item_count
+                stats["excluded_collections"] = self._exclusions.as_stats()
+                _report(f"{self._exclusions.summary()}\n")
+
             # One-time metadata migration (#163): tag any pre-existing docs
             # that lack group_id. Skipped on a force rebuild — the reset
             # below wipes the collection anyway, so every doc gets tagged
@@ -3854,6 +4022,10 @@ class ZoteroSemanticSearch:
                     "documents are excluded from library-filtered search and from "
                     "deletion cleanup."
                 )
+
+            # Records of items that are excluded now (setting just added, or
+            # item just filed) go before any gap or change is looked for.
+            self._purge_excluded_items(stats)
 
             # Resolve include_fulltext default from config if not specified
             if include_fulltext is None:
@@ -4108,6 +4280,10 @@ class ZoteroSemanticSearch:
                         )
                         current_library_keys = None
                     self._run_deletion_pass(stats, current_library_keys, allow_mass_deletion)
+
+            # exclude_collections: every fetch above already dropped these;
+            # this is the last check before anything is embedded or submitted.
+            all_items = self._drop_excluded(all_items, by_item_library=True)
 
             if limit is not None:
                 # A limited run may index only a subset; promoting would strand
@@ -4432,6 +4608,7 @@ class ZoteroSemanticSearch:
             return stats
         finally:
             self._run_group_id = None
+            self._exclusions = None
             self._drop_passages_on_write = False
             self._scan_gaps = {}
             self._level_fill_keys = frozenset()
