@@ -798,7 +798,7 @@ def two_page_pdf(tmp_path, monkeypatch):
     path = str(tmp_path / "two.pdf")
     doc.save(path)
     doc.close()
-    monkeypatch.setattr(read_pdf, "_get_pdf_path", lambda _key, _ctx: (path, "Paper", False))
+    monkeypatch.setattr(read_pdf, "_get_pdf_path", lambda _key, _ctx: (path, "Paper", False, "ATTACH01"))
     return path
 
 
@@ -891,7 +891,7 @@ class TestRenderPages:
         path = str(tmp_path / "long.pdf")
         doc.save(path)
         doc.close()
-        monkeypatch.setattr(read_pdf, "_get_pdf_path", lambda _k, _c: (path, "Long", False))
+        monkeypatch.setattr(read_pdf, "_get_pdf_path", lambda _k, _c: (path, "Long", False, "ATTACH01"))
         with pytest.raises(read_pdf.PdfReadError) as exc:
             read_pdf.render_pdf_pages("KEY00001", 1, 12, ctx=MagicMock())
         assert exc.value.code == "page_limit_exceeded"

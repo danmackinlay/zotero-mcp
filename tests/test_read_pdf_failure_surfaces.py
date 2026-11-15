@@ -184,7 +184,7 @@ def test_invalid_range_is_an_mcp_error(read_server):
 
 def test_unreadable_pdf_is_an_mcp_error(read_server, monkeypatch):
     monkeypatch.setattr(
-        read_pdf_tools, "_get_pdf_path", lambda _key, _ctx: ("/tmp/test.pdf", "Paper", True)
+        read_pdf_tools, "_get_pdf_path", lambda _key, _ctx: ("/tmp/test.pdf", "Paper", True, "ATTACH01")
     )
 
     def _boom(_path):
@@ -201,7 +201,7 @@ def test_unreadable_pdf_is_an_mcp_error(read_server, monkeypatch):
 def test_successful_read_is_not_an_mcp_error(read_server, monkeypatch):
     _patch_extract(monkeypatch, ["Page one body."], total=1)
     monkeypatch.setattr(
-        read_pdf_tools, "_get_pdf_path", lambda _key, _ctx: ("/tmp/test.pdf", "Paper", True)
+        read_pdf_tools, "_get_pdf_path", lambda _key, _ctx: ("/tmp/test.pdf", "Paper", True, "ATTACH01")
     )
 
     result = _call(read_server, {"item_key": ITEM_KEY, "start_page": 1})
