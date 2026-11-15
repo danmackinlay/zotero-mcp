@@ -1753,6 +1753,14 @@ def update_search_database(
             output.append(f"**Added:** {stats.get('added_items', 0)}")
             output.append(f"**Updated:** {stats.get('updated_items', 0)}")
             output.append(f"**Skipped:** {stats.get('skipped_items', 0)}")
+            if "excluded_items" in stats:
+                collections = ", ".join(
+                    f"'{c['collection_name']}' ({c['collection_key']})"
+                    for c in stats.get("excluded_collections") or []
+                )
+                output.append(f"**Excluded:** {stats['excluded_items']} items in {collections} (exclude_collections)")
+            if stats.get("purged_excluded_items"):
+                output.append(f"**Removed as excluded:** {stats['purged_excluded_items']}")
             if stats.get("deleted_items"):
                 output.append(f"**Deleted:** {stats['deleted_items']} (no longer in Zotero)")
             if stats.get("deletion_skipped_reason"):
@@ -1868,7 +1876,10 @@ def get_search_database_status(*, ctx: Context) -> str:
             output.append("```")
             output.append("")
 
+        from zotero_mcp.index_exclusions import describe_config_file
+
         output.append("## Update Configuration")
+        output.append(f"**Excluded Collections:** {describe_config_file(config_path)}")
         output.append(f"**Auto Update:** {update_config.get('auto_update', False)}")
         output.append(f"**Frequency:** {update_config.get('update_frequency', 'manual')}")
         output.append(f"**Last Update:** {update_config.get('last_update', 'Never')}")

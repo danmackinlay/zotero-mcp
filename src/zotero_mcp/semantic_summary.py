@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .index_exclusions import describe_setting
+
 Rows = list[tuple[str, str]]
 
 _BATCH_LABELS = {"openai": "OpenAI", "gemini": "Gemini"}
@@ -88,6 +90,7 @@ def semantic_config_rows(
         )
     rows.append(("Passage chunking", chunk_text))
 
+    rows.append(("Excluded collections", describe_setting(config)))
     rows.append(("Reranker", _enabled((config.get("reranker") or {}).get("enabled", False))))
     rows.append(("Zotero database path", zotero_db_path or config.get("zotero_db_path") or "auto-detect"))
     return rows
