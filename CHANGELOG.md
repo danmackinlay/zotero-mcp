@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Keyword passage search, with no embedding model.** A new keyword index finds the passages of your PDFs that contain given words, ranked by BM25, from a SQLite FTS5 file beside the ChromaDB directory. It is built on the CPU from the same extracted text and the same passage splitter as passage chunking, so a library too large to embed (days of GPU time for every passage) can still be searched passage by passage. It suits looking up a named result, a theorem, a lemma, an author's construction: on a pilot of 25 theorem-lookup queries it found the right passage in the top 10 about as often as small embedding models. Turn it on with `semantic_search.keyword_index.enabled`, which keeps it up to date after every `update-db`, or build it alone with `zotero-mcp update-db --keyword-only` (or `keyword_index.keyword_only` in config), which embeds nothing and opens no ChromaDB index. It needs local mode. Each run extracts only items whose modification date, attachments or keyword settings changed, removes items gone from the library, and never parses an attachment that gave no text again until something changes. Its passages are not capped at `chunking.max_chunks_per_item` (`keyword_index.max_chunks_per_item`, default 0 for no cap), and `keyword_index.pdf_max_pages` can raise the page cap for this index alone, to index whole books. Search it with the new `zotero_keyword_search` tool, in the opt-in `keyword` toolset (`ZOTERO_MCP_TOOLSETS=default,keyword`), or `zotero-cli search --mode keyword` (with `--json`, the passages and their text). Any of the words may match and passages with more of the rarer ones rank first; word endings, accents and the kind of dash in a hyphenated name are ignored, a phrase in double quotes must appear as written, and punctuation, LaTeX and FTS5 operators in a query are read as text, never as syntax. Each hit is one passage per item, with the item key, the PDF's attachment key and the pages it spans, written as the `zotero_read_pdf_pages` call (or `zotero-cli read` command) that opens them. `db-status` and `zotero_get_search_database_status` report its counts.
+
 ## [0.17.2] - 2026-11-14
 
 ### Added
