@@ -6,8 +6,10 @@ with the existing Zotero client to enable vector-based similarity search
 over research libraries.
 """
 
+import bisect
 import contextlib
 import functools
+import itertools
 import json
 import logging
 import os
@@ -53,12 +55,14 @@ from .embeddings.base import EmbeddingAPIUnreachable
 from .embeddings.registry import batch_capable_providers
 from .extract import PAGE_SEPARATOR
 from .identifiers import metadata_match_keys
+from .keyword_index import KeywordIndex, keyword_index_path, load_keyword_config
 from .local_db import PERSONAL_LIBRARY_GROUP_ID, LocalZoteroReader
 from .utils import (
     _paginate,
     ensure_private_dir,
     format_creators,
     is_local_mode,
+    item_display_date,
     suppress_stdout,
     write_json_atomic,
 )
@@ -73,6 +77,11 @@ _BATCH_MODULES = {"openai": openai_batch, "gemini": gemini_batch}
 
 SEARCH_ARTICLES = "articles"
 SEARCH_PASSAGES = "passages"
+
+_KEYWORD_NEEDS_LOCAL = (
+    "The keyword passage index reads zotero.sqlite and the attachment files directly, "
+    "so it needs local mode (ZOTERO_LOCAL=true, or run 'zotero-mcp setup')."
+)
 
 
 def _count_items(count: int) -> str:
@@ -1287,6 +1296,7 @@ class ZoteroSemanticSearch:
         config_path: str | None = None,
         db_path: str | None = None,
         extraction_workers: int | None = None,
+        keyword_only: bool = False,
     ):
         """
         Initialize semantic search.
@@ -1297,8 +1307,13 @@ class ZoteroSemanticSearch:
             db_path: Optional path to Zotero database (overrides config file)
             extraction_workers: Optional parallel-extraction worker count
                 (overrides ``semantic_search.extraction.workers`` in config)
+            keyword_only: Open no ChromaDB index and no embedding model; only
+                the keyword passage index (``update_keyword_index``) works.
         """
-        self.chroma_client = chroma_client or create_chroma_client(config_path)
+        if keyword_only:
+            self.chroma_client = chroma_client
+        else:
+            self.chroma_client = chroma_client or create_chroma_client(config_path)
         self.zotero_client = get_zotero_client()
         self._chroma_call_lock = threading.Lock()
         self.config_path = config_path
@@ -1322,6 +1337,9 @@ class ZoteroSemanticSearch:
         # Passage-level chunking (opt-in; default off preserves item-level
         # indexing and existing collections byte-for-byte).
         self._chunking_config = self._load_chunking_config()
+
+        # Keyword (BM25) passage index, a SQLite FTS5 file beside ChromaDB.
+        self._keyword_config = load_keyword_config(config_path)
 
     def _load_chunking_config(self) -> dict[str, Any]:
         """Load passage-chunking configuration from file or use defaults.
@@ -1349,6 +1367,15 @@ class ZoteroSemanticSearch:
     @property
     def _chunking_enabled(self) -> bool:
         return bool(self._chunking_config.get("enabled", False))
+
+    # Set in __init__; None on instances built without it (test doubles).
+    _keyword_config: dict[str, Any] | None = None
+
+    def _keyword_settings(self) -> dict[str, Any]:
+        """``semantic_search.keyword_index``, with what it inherits filled in."""
+        if self._keyword_config is None:
+            return load_keyword_config(getattr(self, "config_path", None))
+        return self._keyword_config
 
     # Set per run by update_database; see _prune_stale_chunks.
     _drop_passages_on_write = False
@@ -3610,7 +3637,76 @@ class ZoteroSemanticSearch:
 
         Returns:
             Update statistics
+
+        When ``semantic_search.keyword_index`` is enabled the keyword passage
+        index is brought up to date after the embeddings, and its statistics
+        are under ``stats["keyword_index"]``; with ``keyword_only`` it is the
+        only thing updated, and no embedding model is used.
         """
+        keyword = self._keyword_settings()
+        if keyword.get("keyword_only"):
+            return self.update_keyword_index(
+                force_rebuild=force_full_rebuild,
+                limit=limit,
+                allow_mass_deletion=allow_mass_deletion,
+            )
+        stats = self._update_embedding_index(
+            force_full_rebuild=force_full_rebuild,
+            limit=limit,
+            extract_fulltext=extract_fulltext,
+            include_fulltext=include_fulltext,
+            use_openai_batch=use_openai_batch,
+            use_gemini_batch=use_gemini_batch,
+            use_batch=use_batch,
+            batch_provider=batch_provider,
+            batch_max_tokens=batch_max_tokens,
+            batch_max_requests=batch_max_requests,
+            auto_loop=auto_loop,
+            batch_poll_interval=batch_poll_interval,
+            allow_mass_deletion=allow_mass_deletion,
+            automatic=automatic,
+        )
+        # The keyword index keeps its own record of what it has indexed, so it
+        # runs whatever the embedding run found to do; it is skipped only when
+        # that run failed or another update holds the lock.
+        if (
+            keyword.get("enabled")
+            and not stats.get("error")
+            and stats.get("skipped_reason") != "another_update_in_progress"
+        ):
+            if is_local_mode():
+                # A rebuild of the embeddings (a model change, a damaged
+                # index) says nothing about the keyword index.
+                stats["keyword_index"] = self.update_keyword_index(
+                    limit=limit, allow_mass_deletion=allow_mass_deletion
+                )
+            else:
+                # Reported, but not a failure of the run: the embeddings were
+                # updated, and a web-mode server should not fail every sync.
+                stats["keyword_index"] = {
+                    "skipped_reason": "local_mode_required",
+                    "skipped_message": _KEYWORD_NEEDS_LOCAL,
+                }
+        return stats
+
+    def _update_embedding_index(
+        self,
+        force_full_rebuild: bool = False,
+        limit: int | None = None,
+        extract_fulltext: bool = False,
+        include_fulltext: bool | None = None,
+        use_openai_batch: bool | None = None,
+        use_gemini_batch: bool | None = None,
+        use_batch: bool | None = None,
+        batch_provider: str | None = None,
+        batch_max_tokens: int | None = None,
+        batch_max_requests: int | None = None,
+        auto_loop: bool = False,
+        batch_poll_interval: int = 60,
+        allow_mass_deletion: bool = False,
+        automatic: bool = False,
+    ) -> dict[str, Any]:
+        """The embedding half of :meth:`update_database`; same arguments."""
         logger.info("Starting database update...")
         start_time = datetime.now()
 
@@ -5900,6 +5996,7 @@ class ZoteroSemanticSearch:
             },
             "should_update": self.should_update_database(),
             "last_update": self.update_config.get("last_update"),
+            "keyword_index": self.keyword_index_status(),
         }
 
     def delete_item(self, item_key: str) -> bool:
@@ -5912,11 +6009,359 @@ class ZoteroSemanticSearch:
             logger.error(f"Error deleting item {item_key}: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # Keyword (BM25) passage index
+    # ------------------------------------------------------------------
+
+    #: Items handed to the extractor at once. Its process pool holds every
+    #: result until the call ends, so this bounds the text in memory.
+    KEYWORD_EXTRACT_SLICE = 256
+    #: Items written between commits: an interrupted build keeps what it did.
+    KEYWORD_COMMIT_EVERY = 50
+    #: A build that writes at least this many items merges the FTS segments.
+    KEYWORD_OPTIMIZE_AFTER = 1000
+
+    def open_keyword_index(self) -> KeywordIndex:
+        """The keyword index this configuration points at, created if missing."""
+        return KeywordIndex(keyword_index_path(config=self._keyword_settings()))
+
+    def _keyword_passages(self, doc_text: str) -> list[dict[str, Any]]:
+        """Split an item's text into keyword-index passages with their positions.
+
+        The same splitter as the embedding passages, at the configured
+        ``chunking`` size, never shrunk to fit a model; ``max_chunks_per_item``
+        of 0 keeps every passage. ``page``/``page_end`` are the pages the
+        passage starts and ends on, when the text has page breaks.
+        """
+        cfg = self._keyword_settings()
+        text = (doc_text or "").strip()
+        max_chunks = int(cfg.get("max_chunks_per_item") or 0) or sys.maxsize
+        passages = split_into_passages(
+            text, int(cfg.get("chunk_size", 1500)), int(cfg.get("overlap", 200)), max_chunks
+        )
+        if not passages:
+            return []
+        # Page breaks found once: counting them per passage is quadratic in a book.
+        breaks = [m.start() for m in re.finditer(_PAGE_SEPARATOR, text)]
+        marks = _section_offsets(text)
+        out: list[dict[str, Any]] = []
+        for index, (chunk, start, end) in enumerate(passages):
+            passage: dict[str, Any] = {
+                "chunk_index": index,
+                "text": chunk,
+                "char_start": start,
+                "char_end": end,
+            }
+            if breaks:
+                passage["page"] = bisect.bisect_left(breaks, start) + 1
+                passage["page_end"] = bisect.bisect_left(breaks, max(start, end - 1)) + 1
+            if (section := _section_at(marks, start)) is not None:
+                passage["section"] = section
+            out.append(passage)
+        return out
+
+    def _keyword_profile(self, reader) -> str:
+        """The settings an item's keyword passages depend on; a change re-indexes it."""
+        cfg = self._keyword_settings()
+        resolve_pages = getattr(reader, "_resolve_pdf_max_pages", None)
+        pages = resolve_pages() if resolve_pages else cfg.get("pdf_max_pages")
+        return (
+            f"size={cfg.get('chunk_size')};overlap={cfg.get('overlap')};"
+            f"max={int(cfg.get('max_chunks_per_item') or 0)};pages={pages}"
+        )
+
+    def update_keyword_index(
+        self,
+        *,
+        force_rebuild: bool = False,
+        limit: int | None = None,
+        allow_mass_deletion: bool = False,
+    ) -> dict[str, Any]:
+        """Bring the keyword passage index up to date with the local Zotero library.
+
+        Independent of ChromaDB and of any embedding model. It reads
+        ``zotero.sqlite`` and the attachment files directly (local mode),
+        extracting text the same way ``update-db --fulltext`` does, and keeps
+        its own record of what each item was built from: an item is extracted
+        again only when its ``dateModified``, its attachment set, the
+        attachment priority or the keyword settings change. Items no longer in
+        the library are removed. ``force_rebuild`` empties the index first.
+        ``limit`` (a test run) also skips the deletion pass.
+        """
+        start_time = datetime.now()
+        stats: dict[str, Any] = {
+            "total_items": 0,
+            "indexed_items": 0,
+            "unchanged_items": 0,
+            "metadata_only_items": 0,
+            "failed_items": 0,
+            "deleted_items": 0,
+            "passages_written": 0,
+            "errors": 0,
+            "start_time": start_time.isoformat(),
+            "duration": None,
+        }
+
+        def finish() -> dict[str, Any]:
+            end_time = datetime.now()
+            stats["duration"] = str(end_time - start_time)
+            stats["end_time"] = end_time.isoformat()
+            return stats
+
+        if not is_local_mode():
+            stats["error"] = _KEYWORD_NEEDS_LOCAL
+            return finish()
+
+        lock_path = _update_lock_path()
+        lock_cm = _acquire_update_lock(lock_path)
+        if not lock_cm.__enter__():
+            lock_cm.__exit__(None, None, None)
+            holder_pid, _alive = read_lock_holder(lock_path)
+            logger.warning(
+                "Another index update is running (lock held at %s by pid %s); "
+                "skipping the keyword index update.",
+                lock_path, holder_pid or "unknown",
+            )
+            stats["skipped_reason"] = "another_update_in_progress"
+            return finish()
+        try:
+            with self.open_keyword_index() as index:
+                stats["path"] = str(index.path)
+                if force_rebuild:
+                    index.clear()
+                self._fill_keyword_index(
+                    index, stats, limit=limit, force_rebuild=force_rebuild,
+                    allow_mass_deletion=allow_mass_deletion,
+                )
+                stats["index"] = index.stats()
+        except Exception as e:
+            logger.error(f"Keyword index update failed: {e}")
+            stats["error"] = str(e)
+        finally:
+            lock_cm.__exit__(None, None, None)
+        return finish()
+
+    def _fill_keyword_index(
+        self,
+        index: KeywordIndex,
+        stats: dict[str, Any],
+        *,
+        limit: int | None,
+        force_rebuild: bool,
+        allow_mass_deletion: bool,
+    ) -> None:
+        cfg = self._keyword_settings()
+        section: dict[str, Any] = {}
+        if self.config_path and os.path.exists(self.config_path):
+            try:
+                with open(self.config_path) as f:
+                    section = json.load(f).get("semantic_search", {}) or {}
+            except Exception as e:
+                logger.warning(f"Error reading config for the keyword index: {e}")
+        extraction = section.get("extraction") or {}
+        workers = self.extraction_workers or extraction.get("workers") or 1
+        workers = max(1, min(int(workers), os.cpu_count() or 1))
+        collection_keys = section.get("collection_keys")
+
+        with (
+            suppress_stdout(),
+            LocalZoteroReader(
+                db_path=self.db_path or section.get("zotero_db_path"),
+                pdf_max_pages=cfg.get("pdf_max_pages"),
+                attachment_priority=extraction.get("attachment_priority"),
+                extraction_workers=workers,
+                # The transient cache holds text only until it is embedded,
+                # which never happens here: it would keep the whole library.
+                fulltext_cache_enabled=False,
+                config_path=self.config_path,
+            ) as reader,
+        ):
+            priority_tag = ",".join(reader.attachment_priority)
+            profile = self._keyword_profile(reader)
+            key_group_map, excluded_keys = reader.get_key_group_map()
+            _report("Scanning local Zotero database for the keyword index...\n")
+            local_items = reader.get_items_with_text(
+                limit=limit, include_fulltext=False, collection_keys=collection_keys
+            )
+            if excluded_keys:
+                local_items = [it for it in local_items if it.key not in excluded_keys]
+            local_items = _drop_superseded_preprints(local_items)
+            stats["total_items"] = len(local_items)
+
+            states = {} if force_rebuild else index.item_states()
+            pending: list[tuple[Any, dict[str, Any]]] = []
+            for it in local_items:
+                attachment_keys = ",".join(
+                    sorted(k for k, _p, _c in reader.get_fulltext_meta_for_item(it.item_id))
+                )
+                basis = {
+                    "date_modified": it.date_modified,
+                    "attachment_keys": attachment_keys,
+                    "attachment_priority": priority_tag,
+                    "profile": profile,
+                    "group_id": key_group_map.get(it.key),
+                }
+                state = states.get(it.key)
+                if state is not None and all(state.get(k) == v for k, v in basis.items()):
+                    stats["unchanged_items"] += 1
+                    continue
+                pending.append((it, basis))
+
+            _report(
+                f"Keyword index: {len(pending):,} of {len(local_items):,} items to index "
+                f"({stats['unchanged_items']:,} unchanged).\n"
+            )
+            written = 0
+            extract_logger = logging.getLogger("zotero_mcp.extract")
+            previous_level = extract_logger.level
+            extract_logger.setLevel(logging.CRITICAL)
+            try:
+                for offset in range(0, len(pending), self.KEYWORD_EXTRACT_SLICE):
+                    chunk = pending[offset : offset + self.KEYWORD_EXTRACT_SLICE]
+                    try:
+                        hydrated = reader.get_items_by_keys([it.key for it, _ in chunk])
+                    except Exception:
+                        hydrated = {}
+                    by_id = {it.item_id: (it, basis) for it, basis in chunk}
+                    to_extract = []
+                    results: list[tuple[int, Any]] = []
+                    for it, basis in chunk:
+                        if basis["attachment_keys"]:
+                            to_extract.append((it.item_id, it.key))
+                        else:
+                            results.append((it.item_id, None))
+                    for item_id, result in itertools.chain(
+                        results, _extract_fulltext_batch(reader, to_extract)
+                    ):
+                        it, basis = by_id[item_id]
+                        try:
+                            self._write_keyword_item(
+                                index, reader, it, basis, result, hydrated.get(it.key), stats
+                            )
+                        except Exception as e:
+                            stats["errors"] += 1
+                            logger.error(f"Keyword index: could not index item {it.key}: {e}")
+                        written += 1
+                        if written % self.KEYWORD_COMMIT_EVERY == 0:
+                            index.commit()
+                        if written % 10 == 0 or written == len(pending):
+                            _report(f"\r  Keyword index: {written:,}/{len(pending):,} items")
+                    index.commit()
+            finally:
+                extract_logger.setLevel(previous_level)
+            if pending:
+                _report("\n")
+
+            # Deletions: whatever this scan did not see. A limited run saw a
+            # part of the library and deletes nothing.
+            if limit is None:
+                current = {it.key for it in local_items}
+                stored = index.item_keys()
+                to_delete = sorted(stored - current)
+                if to_delete and not allow_mass_deletion and (
+                    not current
+                    or (
+                        len(to_delete) >= _MASS_DELETION_MIN_DOCS
+                        and len(to_delete) >= _MASS_DELETION_MIN_FRACTION * len(stored)
+                    )
+                ):
+                    logger.warning(
+                        f"The keyword index would remove {len(to_delete)} of {len(stored)} items; "
+                        "skipping, as that usually means the scan was incomplete. If the "
+                        "deletions are intentional, rerun once with --allow-mass-deletion."
+                    )
+                    stats["deletion_skipped_reason"] = "mass_deletion_guard"
+                elif to_delete:
+                    stats["deleted_items"] = index.delete_items(to_delete)
+                    index.commit()
+            if written >= self.KEYWORD_OPTIMIZE_AFTER:
+                index.optimize()
+
+    def _write_keyword_item(
+        self,
+        index: KeywordIndex,
+        reader,
+        it,
+        basis: dict[str, Any],
+        result: tuple[str, str] | None,
+        hydrated: dict[str, Any] | None,
+        stats: dict[str, Any],
+    ) -> None:
+        """Index one scanned item: its metadata text, then its full text if any."""
+        text, source = result if result else ("", "")
+        data = (hydrated or {}).get("data") or {}
+        creators = data.get("creators")
+        if creators is None:
+            creators = self._parse_creators_string(it.creators) if it.creators else []
+        item_type = data.get("itemType") or getattr(it, "item_type", None) or "journalArticle"
+        structured = self._create_document_text({
+            "key": it.key,
+            "data": {
+                "itemType": item_type,
+                "title": it.title or "",
+                "abstractNote": it.abstract or "",
+                "creators": creators,
+            },
+        })
+        if text.strip():
+            doc_text = f"{structured}\n\n{text}" if structured.strip() else text
+            fulltext = "yes"
+            stats["indexed_items"] += 1
+        else:
+            doc_text = structured
+            fulltext = "failed" if basis["attachment_keys"] else "none"
+            stats["failed_items" if basis["attachment_keys"] else "metadata_only_items"] += 1
+
+        attachment_key = None
+        if source == "pdf":
+            # Pages count in this file; name it so a hit opens the same one.
+            resolve = getattr(reader, "extraction_attachment_key", None)
+            if resolve is not None:
+                try:
+                    attachment_key = resolve(it.item_id)
+                except Exception:
+                    attachment_key = None
+
+        passages = self._keyword_passages(doc_text)
+        stats["passages_written"] += index.replace_item(
+            it.key,
+            {
+                **basis,
+                "item_type": item_type,
+                "title": data.get("title") or it.title or "",
+                "creators": creators,
+                "date": item_display_date(data) if data else "",
+                "attachment_key": attachment_key,
+                "fulltext": fulltext,
+                "fulltext_source": source or None,
+            },
+            passages,
+        )
+
+    def keyword_index_status(self) -> dict[str, Any]:
+        """Settings and counts of the keyword index, without creating it."""
+        cfg = self._keyword_settings()
+        path = keyword_index_path(config=cfg)
+        status: dict[str, Any] = {
+            "enabled": bool(cfg.get("enabled") or cfg.get("keyword_only")),
+            "keyword_only": bool(cfg.get("keyword_only")),
+            "path": str(path),
+            "exists": path.exists(),
+        }
+        if path.exists():
+            try:
+                with KeywordIndex(path, create=False) as index:
+                    status.update(index.stats())
+            except Exception as e:
+                status["error"] = str(e)
+        return status
+
 
 def create_semantic_search(
     config_path: str | None = None,
     db_path: str | None = None,
     extraction_workers: int | None = None,
+    keyword_only: bool = False,
 ) -> ZoteroSemanticSearch:
     """
     Create a ZoteroSemanticSearch instance.
@@ -5926,10 +6371,13 @@ def create_semantic_search(
         db_path: Optional path to Zotero database (overrides config file)
         extraction_workers: Optional parallel-extraction worker count
             (overrides the value in the config file)
+        keyword_only: Open no ChromaDB index or embedding model, for a run
+            that updates only the keyword passage index
 
     Returns:
         Configured ZoteroSemanticSearch instance
     """
     return ZoteroSemanticSearch(
-        config_path=config_path, db_path=db_path, extraction_workers=extraction_workers
+        config_path=config_path, db_path=db_path, extraction_workers=extraction_workers,
+        keyword_only=keyword_only,
     )

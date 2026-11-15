@@ -62,6 +62,7 @@ zotero-cli --json search "diffusion models" --limit 5 --detail keys_only \
 |---|---|---|
 | `items` (default) | a title, author or phrase you know | `search "Vaswani attention"` |
 | `semantic` | a topic or idea, no exact wording | `search --mode semantic "why transformers scale"` |
+| `keyword` | passages with distinctive words | `search --mode keyword "Banach-Steinhaus"` |
 | `tag` | items you filed under a tag | `search --mode tag "to-read,important"` |
 | `advanced` | structured field conditions | `search --mode advanced --conditions '[...]'` |
 | `citekey` | a BibTeX citation key | `search --mode citekey smith2020` |

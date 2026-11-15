@@ -18,7 +18,7 @@ but not follow a sub-command: `get --json metadata KEY` parses and
 ## `search (alias: s)`
 
  - `<query>` -- Search query
- - `--mode` -- one of `items`, `tag`, `citekey`, `advanced`, `semantic`, `notes` -- default `items` -- Search mode (default: items)
+ - `--mode` -- one of `items`, `tag`, `citekey`, `advanced`, `semantic`, `keyword`, `notes` -- default `items` -- Search mode (default: items)
  - `--qmode` -- one of `titleCreatorYear`, `everything` -- default `titleCreatorYear`
  - `--level` -- one of `articles`, `passages` -- With --mode semantic: search articles or passages (default: passages when chunking is on, articles when off)
  - `--collection` -- Scope to a collection key
@@ -328,6 +328,7 @@ but not follow a sub-command: `get --json metadata KEY` parses and
  - `--config-path` -- Path to semantic search configuration file
  - `--db-path` -- Path to Zotero database file (zotero.sqlite), overrides config
  - `--extraction-workers` -- Parse N attachments in parallel during --fulltext (default: semantic_search.extraction.workers, or 1 for sequential). Capped at the CPU count
+ - `--keyword-only` -- Update only the keyword passage index: no embeddings (local mode)
  - `--clear-fulltext-cache` -- Discard the transient extracted-fulltext cache before running, forcing every attachment to be re-parsed
  - `--batch` / `--no-batch` -- mutually exclusive
  - `--batch-provider` -- one of `openai`, `gemini` -- Batch provider to use with --batch (default: inferred from the configured embedding model)

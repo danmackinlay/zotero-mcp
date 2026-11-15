@@ -1686,6 +1686,207 @@ def semantic_search(
         return f"Error in semantic search: {str(e)}"
 
 
+def keyword_search_hits(
+    query: str,
+    limit: int = 10,
+    group_id: int | None = None,
+    config_path: str | Path | None = None,
+) -> dict:
+    """Run a keyword passage search; the shared core of the tool and the CLI's --json.
+
+    Returns ``{"match", "results", "path"}``, or ``{"error": ...}`` when there
+    is no index to search. Imports nothing heavier than sqlite3.
+    """
+    from zotero_mcp.keyword_index import KeywordIndex, KeywordIndexError, keyword_index_path
+
+    config_path = config_path or Path.home() / ".config" / "zotero-mcp" / "config.json"
+    path = keyword_index_path(str(config_path))
+    if not path.exists():
+        return {
+            "error": (
+                f"No keyword passage index at {path}. Build one in local mode with "
+                "'zotero-mcp update-db --keyword-only' (no embedding model needed), or set "
+                "semantic_search.keyword_index.enabled in config.json so 'zotero-mcp update-db' "
+                "keeps it up to date."
+            )
+        }
+    try:
+        with KeywordIndex(path, create=False) as index:
+            found = index.search(query, limit=limit, group_id=group_id)
+            if not found["results"] and not index.stats()["passages"]:
+                return {"error": f"The keyword passage index at {path} is empty. "
+                                 "Run 'zotero-mcp update-db --keyword-only' to build it."}
+    except KeywordIndexError as e:
+        return {"error": str(e)}
+    found["path"] = str(path)
+    return found
+
+
+def _keyword_status_lines(config_path: str) -> list[str]:
+    """The keyword index section of the status tool; empty when it is not in use."""
+    from zotero_mcp.keyword_index import KeywordIndex, keyword_index_path, load_keyword_config
+
+    config = load_keyword_config(config_path)
+    path = keyword_index_path(config=config)
+    if not (config.get("enabled") or config.get("keyword_only") or path.exists()):
+        return []
+    lines = ["", "## Keyword Passage Index"]
+    lines.append(f"**Enabled:** {bool(config.get('enabled') or config.get('keyword_only'))}"
+                 + (" (keyword only, no embeddings)" if config.get("keyword_only") else ""))
+    lines.append(f"**Path:** {path}")
+    if not path.exists():
+        lines.append("**Status:** Not built — run 'zotero-mcp update-db --keyword-only'.")
+        return lines
+    try:
+        with KeywordIndex(path, create=False) as index:
+            stats = index.stats()
+        lines.append(f"**Items:** {stats['items']} ({stats['items_with_fulltext']} with full text)")
+        lines.append(f"**Passages:** {stats['passages']}")
+    except Exception as e:
+        lines.append(f"**Error:** {e}")
+    return lines
+
+
+def _keyword_location(hit: dict) -> str:
+    bits = []
+    if section := hit.get("section"):
+        bits.append(str(section))
+    page, page_end = hit.get("page"), hit.get("page_end")
+    if page is not None:
+        bits.append(f"pp. {page}-{page_end}" if page_end and page_end != page else f"p. {page}")
+    if hit.get("n_chunks"):
+        bits.append(f"passage {hit['chunk_index'] + 1}/{hit['n_chunks']}")
+    return ", ".join(bits)
+
+
+@mcp.tool(
+    name="zotero_keyword_search",
+    description=(
+        "Keyword (BM25) search of PDF passages; no embeddings. For distinctive "
+        "terms: theorem or lemma names, authors, technical phrases ('Banach-"
+        "Steinhaus uniform boundedness'). Give keywords, not a question: any "
+        "word may match, rarer words weigh more, word endings and accents are "
+        "ignored, \"quotes\" force a phrase. Each hit names pages for "
+        "zotero_read_pdf_pages. Scope as in zotero_semantic_search."
+    )
+)
+def keyword_search(
+    query: str,
+    limit: int = 10,
+    library_id: int | str | None = None,
+    search_all_libraries: bool = False,
+    *,
+    ctx: Context,
+) -> str:
+    """Keyword (BM25) search over the passages of the library's full text.
+
+    Not wrapped in ``@with_zotero_api_lock``: it reads only the local keyword
+    index, never the Zotero API.
+
+    Args:
+        query: Distinctive words; quote a phrase to require it exactly.
+        limit: Maximum number of hits (one per item).
+        library_id: 0/"user" for the personal library or a groupID.
+            Defaults to the active library.
+        search_all_libraries: Search every indexed library.
+        ctx: MCP context
+    """
+    return keyword_search_markdown(
+        query, limit=limit, library_id=library_id,
+        search_all_libraries=search_all_libraries, ctx=ctx,
+    )
+
+
+def keyword_search_markdown(
+    query: str,
+    limit: int = 10,
+    library_id: int | str | None = None,
+    search_all_libraries: bool = False,
+    cli: bool = False,
+    *,
+    ctx: Context,
+) -> str:
+    """The keyword tool's result, shared with ``zotero-cli search --mode keyword``.
+
+    Each hit shows an excerpt around the matched words, not the whole passage:
+    it names its pages, and reading them is the next step anyway. ``cli``
+    gives that step as a ``zotero-cli read`` command instead of a tool call.
+    """
+    try:
+        if not query or not query.strip():
+            return "Error: Search query cannot be empty"
+        try:
+            explicit_group_id = _helpers._parse_library_id_param(library_id)
+        except ValueError as e:
+            return f"Error: {e}"
+        if search_all_libraries and explicit_group_id is not None:
+            return (
+                "Error: library_id and search_all_libraries are mutually exclusive; "
+                "pass whichever you meant, not both."
+            )
+        group_id = None if search_all_libraries else (
+            explicit_group_id if explicit_group_id is not None else _client.get_active_group_id()
+        )
+        limit = max(1, min(int(limit), 100))
+
+        found = keyword_search_hits(query, limit=limit, group_id=group_id)
+        if found.get("error"):
+            return f"Error: {found['error']}"
+        if found.get("match") is None:
+            return (
+                f"Error: no searchable words in '{query}'. Give distinctive words, "
+                "e.g. a theorem name, an author or a technical term."
+            )
+        hits = found["results"]
+        searched = f"*Searched for: {found['match']}*"
+        if not hits:
+            return (
+                f"No passages found for '{query}'.\n\n{searched}\n\n"
+                "Try fewer or different words (a name, a distinctive term), or "
+                "zotero_semantic_search for a description in your own words."
+            )
+
+        output = [f"# Keyword Search Results for '{query}'", "", searched, ""]
+        if search_all_libraries:
+            output += ["*Scope: all indexed libraries.*", ""]
+        output += [f"Found {len(hits)} passages, best first:", ""]
+        for i, hit in enumerate(hits, 1):
+            passage = hit.get("snippet") or hit.get("text", "")[:400]
+            extra = {"Relevance": f"{hit['score']:.2f} (BM25)"}
+            if location := _keyword_location(hit):
+                extra["Location"] = location
+            if hit.get("page") is not None:
+                target = hit.get("attachment_key") or hit["item_key"]
+                page, page_end = hit["page"], hit.get("page_end") or hit["page"]
+                if cli:
+                    end = f" --end-page {page_end}" if page_end != page else ""
+                    extra["Read"] = f"zotero-cli read {target} --start-page {page}{end}"
+                else:
+                    end = f", end_page={page_end}" if page_end != page else ""
+                    extra["Read"] = f'zotero_read_pdf_pages(item_key="{target}", start_page={page}{end})'
+            if search_all_libraries and hit.get("group_id") is not None:
+                gid = hit["group_id"]
+                extra["Library"] = "personal" if gid == PERSONAL_LIBRARY_GROUP_ID else f"group {gid}"
+            if passage:
+                extra["Matched Passage"] = " ".join(passage.split())
+            item = {
+                "key": hit["item_key"],
+                "data": {
+                    "itemType": hit.get("item_type") or "document",
+                    "title": hit.get("title") or "",
+                    "creators": hit.get("creators") or [],
+                    "date": hit.get("date") or "",
+                },
+            }
+            output.extend(_utils.format_item_result(
+                item, index=i, abstract_len=0, include_tags=False, extra_fields=extra,
+            ))
+        return "\n".join(output)
+    except Exception as e:
+        ctx.error(f"Error in keyword search: {str(e)}")
+        return f"Error in keyword search: {str(e)}"
+
+
 @mcp.tool(
     name="zotero_update_search_database",
     description=(
@@ -1747,7 +1948,7 @@ def update_search_database(
             output.append(f"**Error:** {stats['error']}")
         elif stats.get("skipped_message"):
             output.append(stats["skipped_message"])
-        else:
+        elif "passages_written" not in stats:  # a keyword-only run reports below
             output.append(f"**Total items:** {stats.get('total_items', 0)}")
             output.append(f"**Processed:** {stats.get('processed_items', 0)}")
             output.append(f"**Added:** {stats.get('added_items', 0)}")
@@ -1764,6 +1965,24 @@ def update_search_database(
                 output.append(f"**Started:** {stats['start_time']}")
             if stats.get('end_time'):
                 output.append(f"**Completed:** {stats['end_time']}")
+
+        # Present after an embedding run with the keyword index enabled, and
+        # as the whole result of a keyword-only one.
+        keyword = stats.get("keyword_index") or (stats if "passages_written" in stats else None)
+        if keyword:
+            output += ["", "## Keyword passage index"]
+            if keyword.get("error"):
+                output.append(f"**Error:** {keyword['error']}")
+            elif keyword.get("skipped_reason"):
+                output.append(f"**Skipped:** {keyword.get('skipped_message') or keyword['skipped_reason']}")
+            else:
+                output.append(f"**Items indexed:** {keyword.get('indexed_items', 0)} with full text, "
+                              f"{keyword.get('metadata_only_items', 0)} metadata only")
+                output.append(f"**Unchanged:** {keyword.get('unchanged_items', 0)}")
+                output.append(f"**Removed:** {keyword.get('deleted_items', 0)}")
+                if index := keyword.get("index"):
+                    output.append(f"**Index:** {index.get('items', 0)} items, "
+                                  f"{index.get('passages', 0)} passages")
 
         return "\n".join(output)
 
@@ -1878,6 +2097,7 @@ def get_search_database_status(*, ctx: Context) -> str:
         if frequency.startswith('every_') and update_config.get('update_days'):
             output.append(f"**Update Interval:** Every {update_config['update_days']} days")
 
+        output.extend(_keyword_status_lines(str(config_path)))
         return "\n".join(output)
 
     except Exception as e:

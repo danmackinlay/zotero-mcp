@@ -121,7 +121,9 @@ class TestReportShape:
 SURFACE_CEILINGS = {
     "(unset - default)": 8_200,
     "none": 7_100,
-    "all": 11_500,
+    # 11,500 until the opt-in `keyword` toolset (zotero_keyword_search,
+    # ~200 tokens) arrived; it is off in the default profile.
+    "all": 11_600,
 }
 
 

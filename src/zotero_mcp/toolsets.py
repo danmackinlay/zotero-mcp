@@ -67,6 +67,11 @@ TOOLSETS: dict[str, frozenset[str]] = {
     # The semantic index: embedding search over titles, abstracts and full
     # text. Needs the `[semantic]` extra (ChromaDB plus an embedding model).
     "semantic": frozenset({"zotero_semantic_search"}),
+    # Keyword (BM25) passage search over a SQLite FTS5 index of the full
+    # text. Needs no embedding model and no extra, but answers only once the
+    # index is built (``zotero-mcp update-db --keyword-only``), so it is
+    # opt-in rather than a cost on every session.
+    "keyword": frozenset({"zotero_keyword_search"}),
     # Corpus-level exploration against OpenAlex: related papers, coverage of
     # a field. Independent of the semantic index.
     "discovery": frozenset(

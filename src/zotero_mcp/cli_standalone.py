@@ -30,6 +30,7 @@ from zotero_mcp.cli import (
     add_batch_status_arguments,
     add_update_db_arguments,
     obfuscate_config_for_display,
+    print_keyword_status,
     run_batch_import,
     run_batch_status,
     run_update_db,
@@ -183,6 +184,7 @@ def _reports_failure(text: str) -> bool:
 # dead end.
 _CLI_EQUIVALENTS = {
     "zotero_semantic_search": "`zotero-cli search --mode semantic`",
+    "zotero_keyword_search": "`zotero-cli search --mode keyword`",
     "zotero_search_items": "`zotero-cli search`",
     "zotero_read_pdf_pages": "`zotero-cli read`",
     "zotero_get_pdf_outline": "`zotero-cli outline`",
@@ -332,6 +334,15 @@ def cmd_search(args):
             search_all_libraries=getattr(args, "all_libraries", False),
             level=getattr(args, "level", None), ctx=ctx,
         )
+    elif args.mode == "keyword":
+        if _json_mode(args):
+            _keyword_search_json(args, search_mod, _client)
+            return
+        result = search_mod.keyword_search_markdown(
+            query=args.query, limit=args.limit,
+            search_all_libraries=getattr(args, "all_libraries", False),
+            cli=True, ctx=ctx,
+        )
     elif args.mode == "notes":
         result = annotations.search_notes(query=args.query, limit=args.limit, ctx=ctx)
     else:
@@ -354,6 +365,33 @@ def cmd_search(args):
         })
         return
     print(result)
+
+
+def _keyword_search_json(args, search_mod, _client) -> None:
+    """`search --mode keyword --json`: the passages themselves, not item records.
+
+    The other modes re-fetch the items a search found; a keyword hit's value is
+    where in the item it is (attachment, pages, passage), which an item record
+    does not carry.
+    """
+    if not (args.query or "").strip():
+        _out(args, "search", text="Error: Search query cannot be empty")
+    group_id = None if getattr(args, "all_libraries", False) else _client.get_active_group_id()
+    found = search_mod.keyword_search_hits(args.query, limit=max(1, args.limit), group_id=group_id)
+    if found.get("error"):
+        _out(args, "search", text=f"Error: {found['error']}")
+    fields = ("item_key", "attachment_key", "page", "page_end", "section", "chunk_index",
+              "n_chunks", "score", "title", "date", "item_type", "group_id")
+    passages = []
+    for hit in found.get("results", []):
+        entry = {k: hit[k] for k in fields if hit.get(k) is not None}
+        entry["passage"] = hit.get("snippet") or ""
+        entry["text"] = hit.get("text", "")
+        passages.append(entry)
+    _out(args, "search", data={
+        "query": args.query, "mode": "keyword", "match": found.get("match"),
+        "count": len(passages), "passages": passages,
+    })
 
 
 def cmd_get(args):
@@ -1218,6 +1256,7 @@ def cmd_db(args):
         print(f"- Should update: {status.get('should_update', False)}")
         print(f"- OpenAI Batch API: {'active' if bc.get('active') else 'inactive'}")
         print(f"- Passage chunking: {_format_chunking_status(status)}")
+        print_keyword_status(status.get("keyword_index"))
         if ci.get("unreadable"):
             from zotero_mcp.chroma_client import unreadable_index_message
 
@@ -1780,7 +1819,7 @@ def build_parser() -> argparse.ArgumentParser:
     # search
     s_p = sub.add_parser("search", help="Search your Zotero library", aliases=["s"])
     s_p.add_argument("query", nargs="?", default="", help="Search query")
-    s_p.add_argument("--mode", choices=["items", "tag", "citekey", "advanced", "semantic", "notes"],
+    s_p.add_argument("--mode", choices=["items", "tag", "citekey", "advanced", "semantic", "keyword", "notes"],
                      default="items", help="Search mode (default: items)")
     s_p.add_argument("--qmode", choices=["titleCreatorYear", "everything"],
                      default="titleCreatorYear")
