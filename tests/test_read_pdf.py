@@ -81,7 +81,7 @@ class TestHappyPath:
         _patch_extract(monkeypatch, ["Page 1 content."] * 10, total=10)
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "Test Paper", True),
+            lambda _k, _c: ("/tmp/test.pdf", "Test Paper", True, "ATTACH01"),
         )
 
         result = server.read_pdf_pages(item_key="ITEM01", start_page=3, ctx=dummy_ctx)
@@ -99,7 +99,7 @@ class TestHappyPath:
         ])
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "Test Paper", True),
+            lambda _k, _c: ("/tmp/test.pdf", "Test Paper", True, "ATTACH01"),
         )
 
         result = server.read_pdf_pages(item_key="ITEM01", start_page=2, end_page=4, ctx=dummy_ctx)
@@ -117,7 +117,7 @@ class TestHappyPath:
         _patch_extract(monkeypatch, ["hello"])
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "My Paper Title", True),
+            lambda _k, _c: ("/tmp/test.pdf", "My Paper Title", True, "ATTACH01"),
         )
 
         result = server.read_pdf_pages(item_key="KEY123", start_page=1, ctx=dummy_ctx)
@@ -170,7 +170,7 @@ class TestErrors:
         _patch_extract(monkeypatch, ["p1"], total=1)
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "Paper", True),
+            lambda _k, _c: ("/tmp/test.pdf", "Paper", True, "ATTACH01"),
         )
 
         with pytest.raises(PdfReadError) as exc:
@@ -187,7 +187,7 @@ class TestErrors:
         _patch_extract(monkeypatch, ["p1", "p2", "p3"], total=3)
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "Paper", True),
+            lambda _k, _c: ("/tmp/test.pdf", "Paper", True, "ATTACH01"),
         )
 
         result = server.read_pdf_pages(item_key="ITEM01", start_page=2, end_page=10, ctx=dummy_ctx)
@@ -201,7 +201,7 @@ class TestErrors:
         _patch_extract(monkeypatch, ["p"] * 100, total=100)
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "Paper", True),
+            lambda _k, _c: ("/tmp/test.pdf", "Paper", True, "ATTACH01"),
         )
 
         with pytest.raises(PdfReadError) as exc:
@@ -215,7 +215,7 @@ class TestErrors:
         than an empty page range."""
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "Paper", True),
+            lambda _k, _c: ("/tmp/test.pdf", "Paper", True, "ATTACH01"),
         )
         _patch_extract_failure(monkeypatch, ValueError("Not a PDF: file is empty"))
 
@@ -233,7 +233,7 @@ class TestErrors:
         path at a time drifted back to returning a string."""
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "Paper", True),
+            lambda _k, _c: ("/tmp/test.pdf", "Paper", True, "ATTACH01"),
         )
         _patch_extract(monkeypatch, ["p1"] * 3, total=3)
 
@@ -266,7 +266,7 @@ class TestEdgeCases:
         _patch_extract(monkeypatch, ["p1", "p2", "p3"])
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "Test Paper", True),
+            lambda _k, _c: ("/tmp/test.pdf", "Test Paper", True, "ATTACH01"),
         )
 
         result = server.read_pdf_pages(item_key="ITEM01", start_page=2, end_page=2, ctx=dummy_ctx)
@@ -279,7 +279,7 @@ class TestEdgeCases:
         _patch_extract(monkeypatch, ["first", "last"])
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "Paper", True),
+            lambda _k, _c: ("/tmp/test.pdf", "Paper", True, "ATTACH01"),
         )
 
         result = server.read_pdf_pages(item_key="ITEM01", start_page=2, ctx=dummy_ctx)
@@ -291,7 +291,7 @@ class TestEdgeCases:
         _patch_extract(monkeypatch, ["", "has text", ""])
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/test.pdf", "Paper", True),
+            lambda _k, _c: ("/tmp/test.pdf", "Paper", True, "ATTACH01"),
         )
 
         result = server.read_pdf_pages(item_key="ITEM01", start_page=1, end_page=3, ctx=dummy_ctx)
@@ -352,7 +352,7 @@ class TestCleanupPathSafety:
         )
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/home/me/Zotero/storage/ABCD/paper.pdf", "Paper", False),
+            lambda _k, _c: ("/home/me/Zotero/storage/ABCD/paper.pdf", "Paper", False, "ATTACH01"),
         )
 
         server.read_pdf_pages(item_key="ITEM01", start_page=1, ctx=dummy_ctx)
@@ -364,7 +364,7 @@ class TestConvertedPages:
     """Page text converted elsewhere replaces the text layer where it exists."""
 
     def _library(self, tmp_path, monkeypatch, pages):
-        """A converted-pages folder and a PDF path inside a storage folder."""
+        """A converted-pages folder for ATTACH01, and a PDF path in its storage folder."""
         root = tmp_path / "converted"
         folder = root / "ATTACH01" / "pages"
         folder.mkdir(parents=True)
@@ -379,7 +379,7 @@ class TestConvertedPages:
         _patch_extract(monkeypatch, ["Garbled p1.", "Garbled p2.", "Garbled p3."])
         pdf = self._library(tmp_path, monkeypatch, {2: "For any $\\delta > 0$ we have\n"})
         monkeypatch.setattr(
-            "zotero_mcp.tools.read_pdf._get_pdf_path", lambda _k, _c: (pdf, "Paper", False),
+            "zotero_mcp.tools.read_pdf._get_pdf_path", lambda _k, _c: (pdf, "Paper", False, "ATTACH01"),
         )
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._garbled_content_flags",
@@ -396,18 +396,64 @@ class TestConvertedPages:
         assert "format='image'" not in result
         assert "Converted text, not the PDF's text layer, on page 2" in result
 
-    def test_attachment_key_given_directly(self, monkeypatch, dummy_ctx, fake_zot, tmp_path):
-        """A downloaded PDF has no storage folder; the key the caller passed still finds its pages."""
+    def test_parent_key_with_downloaded_pdf(self, monkeypatch, dummy_ctx, fake_zot, tmp_path):
+        """A downloaded PDF sits in a temp folder and the caller named the
+        parent, so only the resolved attachment key leads to its pages."""
         _patch_extract(monkeypatch, ["Garbled p1."])
         self._library(tmp_path, monkeypatch, {1: "Converted p1."})
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/zotero_pdf_x/paper.pdf", "Paper", True),
+            lambda _k, _c: ("/tmp/zotero_pdf_x/paper.pdf", "Paper", True, "ATTACH01"),
         )
 
-        result = server.read_pdf_pages(item_key="ATTACH01", start_page=1, ctx=dummy_ctx)
+        result = server.read_pdf_pages(item_key="PARENT01", start_page=1, ctx=dummy_ctx)
 
         assert "Converted p1." in result and "Garbled p1." not in result
+
+    def test_parent_key_resolved_through_the_web_api(self, monkeypatch, dummy_ctx, tmp_path):
+        """End to end through _get_pdf_path: the download reports its attachment key."""
+
+        class ParentZotero:
+            def item(self, item_key):
+                return {"key": item_key, "data": {"itemType": "journalArticle", "title": "Paper"}}
+
+            def children(self, item_key, **kwargs):
+                return [{
+                    "key": "ATTACH01",
+                    "data": {
+                        "itemType": "attachment",
+                        "contentType": "application/pdf",
+                        "filename": "paper.pdf",
+                        "title": "Full Text PDF",
+                    },
+                }]
+
+            def dump(self, key, filename=None, path=None):
+                with open(f"{path}/{filename}", "wb") as handle:
+                    handle.write(b"%PDF-1.4 fake")
+
+        zot = ParentZotero()
+        monkeypatch.setattr("zotero_mcp.utils.is_local_mode", lambda: False)
+        monkeypatch.setattr("zotero_mcp.client.get_zotero_client", lambda: zot)
+        monkeypatch.setattr("zotero_mcp.client.get_local_zotero_client", lambda: None)
+        _patch_extract(monkeypatch, ["Garbled p1."])
+        self._library(tmp_path, monkeypatch, {1: "Converted p1."})
+
+        result = server.read_pdf_pages(item_key="PARENT01", start_page=1, ctx=dummy_ctx)
+
+        assert "Converted p1." in result and "Garbled p1." not in result
+
+    def test_other_attachments_pages_are_not_used(self, monkeypatch, dummy_ctx, fake_zot, tmp_path):
+        """The PDF's folder name is not consulted, only the resolved key."""
+        _patch_extract(monkeypatch, ["Text layer p1."])
+        pdf = self._library(tmp_path, monkeypatch, {1: "Converted p1."})
+        monkeypatch.setattr(
+            "zotero_mcp.tools.read_pdf._get_pdf_path", lambda _k, _c: (pdf, "Paper", False, "ATTACH02"),
+        )
+
+        result = server.read_pdf_pages(item_key="PARENT01", start_page=1, ctx=dummy_ctx)
+
+        assert "Text layer p1." in result and "Converted p1." not in result
 
     def test_no_folder_configured_changes_nothing(self, monkeypatch, dummy_ctx, fake_zot, tmp_path):
         _patch_extract(monkeypatch, ["Text layer p1."])
@@ -417,7 +463,7 @@ class TestConvertedPages:
             "zotero_mcp.tools.read_pdf._converted_pages_dir", lambda: None,
         )
         monkeypatch.setattr(
-            "zotero_mcp.tools.read_pdf._get_pdf_path", lambda _k, _c: (pdf, "Paper", False),
+            "zotero_mcp.tools.read_pdf._get_pdf_path", lambda _k, _c: (pdf, "Paper", False, "ATTACH01"),
         )
 
         result = server.read_pdf_pages(item_key="PARENT01", start_page=1, ctx=dummy_ctx)
@@ -426,7 +472,7 @@ class TestConvertedPages:
         assert "Converted" not in result
 
     def test_key_is_never_used_as_a_path(self, monkeypatch, dummy_ctx, fake_zot, tmp_path):
-        """An item key that is not a Zotero key cannot walk out of the folder."""
+        """An attachment key that is not a Zotero key cannot walk out of the folder."""
         _patch_extract(monkeypatch, ["Text layer p1."])
         self._library(tmp_path, monkeypatch, {1: "Converted p1."})
         outside = tmp_path / "pages"
@@ -434,10 +480,10 @@ class TestConvertedPages:
         (outside / "1.md").write_text("Outside the folder.", encoding="utf-8")
         monkeypatch.setattr(
             "zotero_mcp.tools.read_pdf._get_pdf_path",
-            lambda _k, _c: ("/tmp/zotero_pdf_x/paper.pdf", "Paper", True),
+            lambda _k, _c: ("/tmp/zotero_pdf_x/paper.pdf", "Paper", True, ".."),
         )
 
-        result = server.read_pdf_pages(item_key="..", start_page=1, ctx=dummy_ctx)
+        result = server.read_pdf_pages(item_key="PARENT01", start_page=1, ctx=dummy_ctx)
 
         assert "Text layer p1." in result
         assert "Outside the folder." not in result

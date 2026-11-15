@@ -87,8 +87,8 @@ def _cleanup_path(file_path: str) -> None:
         pass
 
 
-def _get_pdf_path(item_key: str, ctx: Context) -> tuple[str, str, bool] | None:
-    """Resolve a PDF attachment and return ``(file_path, title, is_temp)``.
+def _get_pdf_path(item_key: str, ctx: Context) -> tuple[str, str, bool, str] | None:
+    """Resolve a PDF attachment and return ``(file_path, title, is_temp, attachment_key)``.
 
     Tries local storage first (via LocalZoteroReader), then downloads via API.
     Returns None if no PDF attachment is found.
@@ -98,6 +98,9 @@ def _get_pdf_path(item_key: str, ctx: Context) -> tuple[str, str, bool] | None:
     must clean up. It is False for a file resolved out of the user's Zotero
     storage, which must be left alone: those paths point into the real
     library, and deleting one takes the user's copy of the PDF with it.
+
+    ``attachment_key`` is the key of the PDF attachment the file belongs to,
+    which is ``item_key`` itself only when the caller named the attachment.
     """
     item = _library.get_library_backend().get_item(item_key)
 
@@ -114,7 +117,7 @@ def _get_pdf_path(item_key: str, ctx: Context) -> tuple[str, str, bool] | None:
                 if attachment and "pdf" in (attachment["content_type"] or "").lower():
                     resolved = reader.resolve_attachment_file(item_key)
                     if resolved:
-                        return str(resolved), attachment["title"] or item_key, False
+                        return str(resolved), attachment["title"] or item_key, False, attachment["key"]
 
                 local_item = reader.get_item_by_key(item_key)
                 if local_item:
@@ -122,7 +125,7 @@ def _get_pdf_path(item_key: str, ctx: Context) -> tuple[str, str, bool] | None:
                         if ctype == "application/pdf":
                             resolved = reader.resolve_attachment_file(att_key)
                             if resolved:
-                                return str(resolved), local_item.title or item_key, False
+                                return str(resolved), local_item.title or item_key, False, att_key
     except Exception:
         pass
 
@@ -160,7 +163,7 @@ def _get_pdf_path(item_key: str, ctx: Context) -> tuple[str, str, bool] | None:
         raise
 
     if download.path and download.path.exists() and download.path.stat().st_size > 0:
-        return str(download.path), attachment.title, True
+        return str(download.path), attachment.title, True, attachment.key
 
     _cleanup_path(probe)
     return None
@@ -249,8 +252,8 @@ def _page_range(
 ):
     """Validate a page range against an item's PDF.
 
-    Yields ``(pdf_path, title, total_pages, end_page, clamped_note)`` and
-    removes a downloaded working copy afterwards, never a file in the user's
+    Yields ``(pdf_path, title, total_pages, end_page, clamped_note,
+    attachment_key)`` and removes a downloaded working copy afterwards, never a file in the user's
     library. The range is checked before anything is resolved (#528).
     """
     if not item_key or not item_key.strip():
@@ -269,7 +272,7 @@ def _page_range(
             f"No PDF attachment found for item: {item_key}",
             code="no_pdf_attachment",
         )
-    pdf_path, title, is_temp = result
+    pdf_path, title, is_temp, attachment_key = result
 
     try:
         try:
@@ -304,7 +307,7 @@ def _page_range(
                 code="page_limit_exceeded",
             )
 
-        yield pdf_path, title, total_pages, actual_end, clamped_note
+        yield pdf_path, title, total_pages, actual_end, clamped_note, attachment_key
     finally:
         if is_temp:
             _cleanup_path(pdf_path)
@@ -332,7 +335,7 @@ def _converted_pages_dir() -> Path | None:
     return path if path.is_dir() else None
 
 
-def _converted_pages(item_key: str, pdf_path: str, page_indices) -> dict[int, str]:
+def _converted_pages(attachment_key: str, page_indices) -> dict[int, str]:
     """Converted Markdown for the pages (0-indexed) that have some.
 
     Text extraction loses math, and a scan may have no text layer at all. A
@@ -342,30 +345,24 @@ def _converted_pages(item_key: str, pdf_path: str, page_indices) -> dict[int, st
     ``<dir>/<ATTACHMENT_KEY>/pages/<n>.md``, ``n`` being the 1-indexed page of
     the PDF. A page without a file reads from the text layer as before.
 
-    The attachment key is the name of the PDF's folder in Zotero storage, or
-    ``item_key`` when the caller named the attachment itself. A PDF fetched
-    into a temporary folder through its parent item has neither, and gets no
-    converted pages.
+    ``attachment_key`` is the PDF attachment's own key as ``_get_pdf_path``
+    resolved it, so a read addressed by the parent item finds the same pages.
     """
     root = _converted_pages_dir()
-    if root is None:
+    if root is None or not _ITEM_KEY.match(attachment_key or ""):
         return {}
-    for key in dict.fromkeys((Path(pdf_path).parent.name, item_key.strip())):
-        if not _ITEM_KEY.match(key):
+    folder = root / attachment_key / "pages"
+    if not folder.is_dir():
+        return {}
+    found: dict[int, str] = {}
+    for page_index in page_indices:
+        try:
+            text = (folder / f"{page_index + 1}.md").read_text(encoding="utf-8").strip()
+        except OSError:
             continue
-        folder = root / key / "pages"
-        if not folder.is_dir():
-            continue
-        found: dict[int, str] = {}
-        for page_index in page_indices:
-            try:
-                text = (folder / f"{page_index + 1}.md").read_text(encoding="utf-8").strip()
-            except OSError:
-                continue
-            if text:
-                found[page_index] = text
-        return found
-    return {}
+        if text:
+            found[page_index] = text
+    return found
 
 
 def read_pdf_text(
@@ -384,7 +381,8 @@ def read_pdf_text(
     try:
         with _page_range(item_key, start_page, end_page,
                          max_pages=_TEXT_MAX_PAGES, ctx=ctx) as (pdf_path, title, total_pages,
-                                                                 actual_end, clamped_note):
+                                                                 actual_end, clamped_note,
+                                                                 attachment_key):
             try:
                 # extract_pdf takes 0-indexed pages; the tool's API is 1-indexed.
                 doc = extract_pdf(
@@ -395,7 +393,7 @@ def read_pdf_text(
                     f"Could not read PDF for item {item_key}: {exc}",
                     code="pdf_unreadable",
                 ) from exc
-            converted = _converted_pages(item_key, pdf_path, doc.page_numbers)
+            converted = _converted_pages(attachment_key, doc.page_numbers)
             flags = {
                 page_index: note
                 for page_index, note in _garbled_content_flags(pdf_path, doc).items()
@@ -625,7 +623,7 @@ def find_in_pdf(
     resolved = _get_pdf_path(item_key, ctx)
     if resolved is None:
         raise PdfReadError(f"No PDF attachment found for item: {item_key}", code="no_pdf_attachment")
-    pdf_path, title, is_temp = resolved
+    pdf_path, title, is_temp, _attachment_key = resolved
     try:
         try:
             if start_page is None and end_page is None:
@@ -735,7 +733,8 @@ def render_pdf_pages(
 
     with _page_range(item_key, start_page, end_page,
                      max_pages=_IMAGE_MAX_PAGES, ctx=ctx) as (pdf_path, title, total_pages,
-                                                              actual_end, clamped_note):
+                                                              actual_end, clamped_note,
+                                                              _attachment_key):
         pdf = fitz.open(pdf_path)
         try:
             pages = []
