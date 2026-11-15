@@ -1875,6 +1875,98 @@ class LocalZoteroReader:
 
         return KeyGroupMap(groups, excluded_keys)
 
+    def get_collection_tree(self) -> list[dict[str, Any]]:
+        """Every collection of a user or group library, trashed ones included.
+
+        Rows of ``group_id`` (0 = personal), ``key``, ``name`` and
+        ``parent_key``. For ``semantic_search.exclude_collections``, which
+        errs towards excluding more: a trashed collection's items are still
+        in the library.
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            """
+            SELECT c.key AS key, c.collectionName AS name, p.key AS parent_key,
+                   l.type AS lib_type, g.groupID AS group_id
+            FROM collections c
+            JOIN libraries l ON c.libraryID = l.libraryID
+            LEFT JOIN groups g ON l.libraryID = g.libraryID
+            LEFT JOIN collections p ON p.collectionID = c.parentCollectionID
+            """
+        ).fetchall()
+        tree = []
+        for row in rows:
+            if row["lib_type"] == "user":
+                group_id = PERSONAL_LIBRARY_GROUP_ID
+            elif row["lib_type"] == "group" and row["group_id"] is not None:
+                group_id = int(row["group_id"])
+            else:
+                continue
+            tree.append({
+                "group_id": group_id, "key": row["key"], "name": row["name"],
+                "parent_key": row["parent_key"],
+            })
+        return tree
+
+    def get_collection_member_keys(
+        self, group_id: int, collection_keys: set[str]
+    ) -> tuple[set[str], set[str]]:
+        """Keys of the items filed in ``collection_keys`` of one library, and of their children.
+
+        Direct membership only: the caller passes every subcollection. The
+        children are the items' attachments and notes, and the annotations
+        on those attachments. Trashed items count, so nothing in the trash
+        comes back when it is restored.
+        """
+        conn = self._get_connection()
+        library_id = self._resolve_scope_library_id(group_id)
+        if library_id is None or not collection_keys:
+            return set(), set()
+        keys = sorted(collection_keys)
+        item_ids: set[int] = set()
+        top: set[str] = set()
+        for start in range(0, len(keys), 500):
+            part = keys[start:start + 500]
+            placeholders = ",".join("?" * len(part))
+            for row in conn.execute(
+                f"""
+                SELECT DISTINCT i.itemID, i.key FROM collectionItems ci
+                JOIN collections c ON c.collectionID = ci.collectionID
+                JOIN items i ON i.itemID = ci.itemID
+                WHERE c.libraryID = ? AND c.key IN ({placeholders})
+                """,
+                [library_id, *part],
+            ):
+                item_ids.add(row[0])
+                top.add(row[1])
+
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        children: set[str] = set()
+        frontier = set(item_ids)
+        seen = set(item_ids)
+        # Two levels: attachments and notes, then annotations on attachments.
+        while frontier:
+            ids = sorted(frontier)
+            frontier = set()
+            for table in ("itemAttachments", "itemNotes", "itemAnnotations"):
+                if table not in tables:
+                    continue
+                for start in range(0, len(ids), 500):
+                    part = ids[start:start + 500]
+                    placeholders = ",".join("?" * len(part))
+                    for row in conn.execute(
+                        f"SELECT i.itemID, i.key FROM {table} t JOIN items i ON i.itemID = t.itemID "
+                        f"WHERE t.parentItemID IN ({placeholders})",
+                        part,
+                    ):
+                        if row[0] not in seen:
+                            seen.add(row[0])
+                            frontier.add(row[0])
+                            children.add(row[1])
+        return top, children
+
     def get_items_with_text(self, limit: int | None = None, include_fulltext: bool = False, key_filter: str | None = None, collection_keys: list[str] | None = None) -> list[ZoteroItem]:
         """
         Get all items with their text content for semantic search.

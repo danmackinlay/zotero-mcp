@@ -80,6 +80,10 @@ class SemanticSearchConfig:
     # only passage searches and writes count); 0 keeps ChromaDB in the
     # server process, loaded until it exits.
     idle_unload_minutes: float = 0
+    # Collections (names or keys) whose items, subcollections included,
+    # update-db never indexes or fetches text for; ZOTERO_EXCLUDE_COLLECTIONS
+    # adds to it. Read and enforced by zotero_mcp.index_exclusions.
+    exclude_collections: list[str] = field(default_factory=list)
     # Per-library incremental-sync watermarks, keyed by group_id as a string
     # ("0" = personal library). Every Zotero library has its own independent
     # version counter, so one shared scalar corrupted sync state whenever the
