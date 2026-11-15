@@ -118,6 +118,9 @@ Environment variables set in the shell you launch a client from (for example `cl
 - `GEMINI_BASE_URL`: Custom Gemini endpoint URL (optional, for use with compatible APIs)
 - `OLLAMA_EMBEDDING_MODEL`: Ollama embedding model name (qwen3-embedding by default)
 - `OLLAMA_BASE_URL`: Ollama server URL (default: http://localhost:11434)
+- `ZOTERO_EXCLUDE_COLLECTIONS`: Collections to keep out of the index, added to
+  `semantic_search.exclude_collections` (comma-separated, or a JSON list). See
+  [Keeping collections out of the index](#keeping-collections-out-of-the-index)
 - `ZOTERO_ONNX_THREADS`: Thread count for the default model's ONNX Runtime (optional).
   Where zotero-mcp may run on only some CPUs (a container's cpuset, a Slurm job, taskset),
   set it to that number of CPUs to stop the `pthread_setaffinity_np failed` errors
@@ -270,6 +273,38 @@ Changing this setting marks affected items for re-extraction, so a following `zo
 To read one specific attachment regardless of priority, pass that attachment's own key to `zotero_get_item_fulltext` (find it with `zotero_get_item_children`) — an attachment key bypasses the priority order and reads exactly that file.
 
 Extracted text is reliable for prose and unreliable for math and tables. `zotero_read_pdf_pages` flags the pages where that happens and can return those pages as images (`format='image'`).
+
+## Keeping collections out of the index
+
+`semantic_search.exclude_collections` lists collections whose items the semantic index must never hold, such as manuscripts you are reviewing in confidence. It matters most when the index is built somewhere you would not put those files, for example `zotero-mcp update-db` on a rented GPU machine reading your library through the web API.
+
+```json
+{
+  "semantic_search": {
+    "exclude_collections": ["_review", "ABCD2345"]
+  }
+}
+```
+
+- Each entry is a collection name or its 8-character key. Names match ignoring case. A name that several collections share excludes all of them.
+- An item is excluded if it is filed in a listed collection or in any of its subcollections, however deep, even when it is also filed somewhere else. Its attachments, notes and annotations go with it.
+- `update-db` drops excluded items before it looks at their attachments: no attachment is listed under them, no full text is requested from Zotero, and no PDF is read or extracted. This holds on every path: the web API and the local API, the local database scan (`--fulltext`), full scans, incremental syncs and the runs that fill in missing article or passage records.
+- Items already in the index that are excluded now, because you just added the setting or just filed the item, are deleted from the index (article records and passages) on the next update, and their text is dropped from the transient extraction cache.
+- `ZOTERO_EXCLUDE_COLLECTIONS` adds entries to the config file's, either comma-separated or as a JSON list (`'["Smith, review"]'`) for names that contain a comma. It cannot remove an entry the config file has.
+
+**It fails closed.** `update-db` stops with an error, before it fetches, resets or indexes anything, when an entry matches no collection in the libraries being indexed (a misspelling, or a collection that was renamed), when the collection list or a collection's items cannot be fetched, when the setting is not a list of strings, or when the config file cannot be parsed and mentions `exclude_collections`. Fix the cause and run it again; it never carries on without the exclusion.
+
+**Several libraries.** A local database scan (`update-db --fulltext`) indexes every library in `zotero.sqlite` in one run, and an entry is looked up in all of them: it must match in at least one, and excludes the matching collections wherever they are. A run through the web or local API indexes one library, so an entry must match in that library. To make an entry apply to one library only, write it as `library:<group ID>/<name or key>`, with `library:0/` for My Library: `"library:0/_review"` excludes your own `_review` and is not checked at all when you index a group library.
+
+**It does not hide anything else.** This setting controls what goes into the semantic index and nothing more. The other tools (`zotero_search_items`, item metadata, reading PDFs and notes, Zotero's own search) still find and return these items, and an assistant connected to zotero-mcp can still read them that way.
+
+Other limits to know about:
+
+- Through the web or local API, every `update-db` reads the excluded collections' item lists, and a full scan also lists every item in the library; both carry each item's metadata (title, abstract, creators). A full scan of 25 items or more also lists the library's attachments once (titles and file names, not the files). The excluded items' metadata is therefore downloaded to the machine running `update-db` and held in memory; it is dropped there and never written to the index or a cache. Their attachments and full text are not downloaded.
+- Removing a collection from the list does not bring its items back by itself. An item returns when it next changes, or on a local database scan (`update-db --fulltext`), or a `zotero-mcp update-db --force-rebuild`.
+- A Batch API run submitted before you added the setting still imports what it submitted; the next `update-db` deletes those records again.
+
+`zotero-mcp update-db` prints how many items were excluded and by which collections. `zotero-mcp db-status`, `zotero-cli db status` and the `zotero_get_search_database_status` tool show the configured entries.
 
 ## Passage chunking
 

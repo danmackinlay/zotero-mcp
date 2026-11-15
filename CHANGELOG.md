@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`semantic_search.exclude_collections` keeps collections out of the semantic index.** List collection names or 8-character keys (or set `ZOTERO_EXCLUDE_COLLECTIONS`, which adds to the list), and `update-db` never indexes the items filed in them or in any of their subcollections, even items also filed elsewhere. Excluded items are dropped before their attachments are looked at, so no attachment is listed under them, no full text is requested and no PDF is extracted, on the web API, the local API and the local database scan, in full scans, incremental syncs and gap fills alike. Records of items that become excluded are deleted from the index, articles and passages, on the next update. It fails closed: an entry that matches no collection in the libraries being indexed, or a collection list that cannot be fetched, stops `update-db` before anything is fetched or indexed. `library:<group ID>/<name>` pins an entry to one library. `update-db` reports how many items were excluded and by which collections, and `db-status` shows the setting. It governs the index only: the other tools still return these items. See [Keeping collections out of the index](docs/configuration.md#keeping-collections-out-of-the-index).
+
 ## [0.17.2] - 2026-11-14
 
 ### Added
