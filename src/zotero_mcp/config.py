@@ -65,6 +65,21 @@ class ChunkingConfig:
 
 
 @dataclass
+class KeywordIndexConfig:
+    """The keyword (BM25) passage index; see ``zotero_mcp.keyword_index``."""
+
+    enabled: bool = False
+    # Build only this index: update-db embeds nothing and loads no model.
+    keyword_only: bool = False
+    # 0 keeps every passage (unlike chunking.max_chunks_per_item).
+    max_chunks_per_item: int = 0
+    # None falls back to extraction.pdf_max_pages.
+    pdf_max_pages: int | None = None
+    # None: beside the ChromaDB directory.
+    path: str | None = None
+
+
+@dataclass
 class SemanticSearchConfig:
     embedding_model: str = "default"
     embedding_config: dict[str, Any] = field(default_factory=dict)
@@ -75,6 +90,7 @@ class SemanticSearchConfig:
     include_fulltext: bool = True
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
+    keyword_index: KeywordIndexConfig = field(default_factory=KeywordIndexConfig)
     # Minutes without a semantic search before the MCP server's ChromaDB
     # worker exits and the index's memory is freed (once it holds passages,
     # only passage searches and writes count); 0 keeps ChromaDB in the
