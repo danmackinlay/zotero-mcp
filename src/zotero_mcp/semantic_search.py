@@ -439,6 +439,40 @@ _MASS_DELETION_MIN_FRACTION = 0.25
 _NON_INDEXED_ITEM_TYPES = frozenset({"attachment", "note", "annotation"})
 
 
+def _drop_superseded_preprints(local_items: list) -> list:
+    """Drop a preprint when a journal article in the scan is the same work.
+
+    Matched by the shared doi/title match keys (#496): the same rule the
+    duplicate detector uses, so the two agree on what counts as the same work.
+    """
+    def _work_keys(it):
+        return metadata_match_keys(it, kinds=("doi", "title"))
+
+    prefer_types = {"journalArticle": 2, "preprint": 1}
+    key_to_best = {}
+    for it in local_items:
+        for k in _work_keys(it):
+            cur = key_to_best.get(k)
+            # Prefer journalArticle over preprint; otherwise keep first
+            if cur is None or (
+                prefer_types.get(getattr(it, "item_type", ""), 0)
+                > prefer_types.get(getattr(cur, "item_type", ""), 0)
+            ):
+                key_to_best[k] = it
+
+    filtered_items = []
+    for it in local_items:
+        if getattr(it, "item_type", None) == "preprint" and any(
+            (best := key_to_best.get(k)) is not None
+            and best is not it
+            and getattr(best, "item_type", None) == "journalArticle"
+            for k in _work_keys(it)
+        ):
+            continue
+        filtered_items.append(it)
+    return filtered_items
+
+
 def _extract_fulltext_batch(reader, items):
     """Yield ``(item_id, (text, source) | None)`` for every item in ``items``.
 
@@ -2173,51 +2207,7 @@ class ZoteroSemanticSearch:
                 candidate_count = len(local_items)
                 sys.stderr.write(f"Found {candidate_count} candidate items.\n")
 
-                # Optional deduplication: if preprint and journalArticle share a DOI/title, keep journalArticle
-                # Build index by the shared doi/title match keys (#496): same
-                # rule the duplicate detector uses, so the two agree on what
-                # counts as the same work.
-                def _work_keys(it):
-                    return metadata_match_keys(it, kinds=("doi", "title"))
-
-                key_to_best = {}
-                for it in local_items:
-
-                    def consider(k):
-                        cur = key_to_best.get(k)
-                        # Prefer journalArticle over preprint; otherwise keep first
-                        if cur is None:
-                            key_to_best[k] = it
-                        else:
-                            prefer_types = {"journalArticle": 2, "preprint": 1}
-                            cur_score = prefer_types.get(getattr(cur, "item_type", ""), 0)
-                            new_score = prefer_types.get(getattr(it, "item_type", ""), 0)
-                            if new_score > cur_score:
-                                key_to_best[k] = it
-
-                    for k in _work_keys(it):
-                        consider(k)
-
-                # If a preprint loses against a journal article for same DOI/title, drop it
-                filtered_items = []
-                for it in local_items:
-                    # If there is a journalArticle alternative for same DOI or title, and this is preprint, drop
-                    if getattr(it, "item_type", None) == "preprint":
-                        drop = False
-                        for k in _work_keys(it):
-                            best = key_to_best.get(k)
-                            if (
-                                best is not None
-                                and best is not it
-                                and getattr(best, "item_type", None) == "journalArticle"
-                            ):
-                                drop = True
-                                break
-                        if drop:
-                            continue
-                    filtered_items.append(it)
-
-                local_items = filtered_items
+                local_items = _drop_superseded_preprints(local_items)
                 total_to_extract = len(local_items)
                 if total_to_extract != candidate_count:
                     try:
